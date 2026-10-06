@@ -156,6 +156,18 @@ deliberate design, not decoration — do not "simplify" them away.
   fitted width came out 63% too wide against a plateau that R² fitted faithfully. Rates are divided
   by intensity × pulse width so the curve is a responsivity, not `S(λ)·I(λ)`, and normalisation is
   **per branch** (strongest potentiation → +1, strongest depression → −1) as the spec requires.
+- **Device variability is unit-independent.** `A_peak`/`B_peak` carry units S^(1−α), so a raw
+  lognormal draw on `alpha` scales the rate by W^(Δα) — a 0.1–10× spread in SI, ~1× in µS.
+  `SynapseNetwork._create_synapse_array` rescales `A_peak *= W_ref^(α_ref − α_dev)` (same for
+  `B_peak`/`beta`, `W_ref` = nominal `G_max − G_min`), so "10% variability" means 10% on the rate
+  at the nominal window and the exponent spread only shapes the curve. Pinned by
+  `test_variability_is_independent_of_the_conductance_unit` (SI vs µS agree to 1e-9).
+- **Integrated time is exact.** `VisualSynapse.apply_stimulus` takes whole `dt` steps plus one
+  shortened remainder step, so a duration that is not a multiple of `dt` is not truncated
+  (`rest(45)` at 10 ms advanced only 40 ms). A stimulus shorter than one `dt` still raises.
+- **Retention fit refuses non-decaying data.** `fit_retention_decay` raises when the final 10% of
+  readings is not below the first 10%, or R² ≤ 0, instead of returning τ ~ 1e10 s as a success.
+  The caller records it in `extraction_report` as a failed fit with `decay_tau` flagged default.
 
 ## Verification
 
@@ -217,7 +229,7 @@ GUI tool: loads CSV/Excel measurement files, collects metadata via dialog, compu
 `VisualSynapse` class: the canonical physics implementation. 4-tab GUI: Simulation (interactive pulse/rest), Model Fitting (extract_synapse_model + compare), Network (spatial array with pattern library), SNN (Poisson inputs + STDP learning). Loads experimental JSON characterization → rebuilds VisualSynapse with fitted multi-Gaussian wavelength curve.
 
 ### network.py
-`SynapseNetwork`: N×M grid of VisualSynapse objects, 10% device-to-device variability. `SpatialPatterns`: 20+ masks (bars, diagonals, checkerboard, circle, duck, thumbs_up, raised_fist, etc.). `LIFNeuron`: leaky integrate-and-fire. `SpikingSynapseNetwork`: 2-layer input→hidden SNN with STDP. `MultiLayerSpikingNetwork`: arbitrary-depth feedforward + optional recurrent connections.
+`SynapseNetwork`: N×M grid of VisualSynapse objects, 10% device-to-device variability (lognormal, unit-independent — see invariants). `SpatialPatterns`: 20+ masks (bars, diagonals, checkerboard, circle, duck, thumbs_up, raised_fist, etc.). `LIFNeuron`: leaky integrate-and-fire. `SpikingSynapseNetwork`: 2-layer input→hidden SNN with STDP. `MultiLayerSpikingNetwork`: arbitrary-depth feedforward + optional recurrent connections.
 
 ### snn_visualization.py
 Poisson and rate-coded spike train generation. Raster plots, weight heatmaps, firing rate estimation, STDP/SRDP curve visualization with fitted analytic overlays. `image_to_spike_trains`: deterministic rate coding from 2D images.
@@ -260,6 +272,7 @@ fitted_model → network.py (SynapseNetwork / SNN arrays)
 Python 3, CustomTkinter, matplotlib (FigureCanvasTkAgg), numpy, scipy.optimize, pyvisa, PIL/Pillow, openpyxl. PyInstaller-compatible (resource_path, sys.frozen).
 
 ## File Naming
+- Remote: `origin` = github.com/zacharie-li-kao/SYNAPSYS-MODEL (code only — docs, audits, `Patterns/`, `shared_source_zhiqiang_fu/` stay untracked). Pre-migration history is on local branch `legacy-main` / remote `legacy`.
 - Active files are at project root. `Save *` directories are historical backups — do not modify.
 - `keithley_analyser.py` is the canonical Keithley controller. Version is tracked via `__version__` inside the module.
 - `Keithley_Dual_SMU_Parameters_Analyser_4_2_2.py` exists as a historical variant — not canonical.
