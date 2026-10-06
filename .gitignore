@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+dist/
+archive/
+Taizo/
+samples/
+test_export/
+test_export.rar
+startup_log.txt
+.claude/
