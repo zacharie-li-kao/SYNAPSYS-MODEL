@@ -81,6 +81,25 @@ def test_conductance_stays_physical_after_stimulation(variability):
     assert np.all(net.G_matrix > 0), "negative conductance after depression"
 
 
+def test_variability_is_independent_of_the_conductance_unit():
+    """A_peak carries S^(1-alpha); an alpha spread must not scale the rate by W^(d alpha)."""
+    k = 1e6
+    micro = dict(BASE_PARAMS, G_min=BASE_PARAMS['G_min'] * k, G_max=BASE_PARAMS['G_max'] * k,
+                 A_peak=BASE_PARAMS['A_peak'] * k ** (1 - BASE_PARAMS['alpha']),
+                 B_peak=BASE_PARAMS['B_peak'] * k ** (1 - BASE_PARAMS['beta']))
+    norm = []
+    for params in (BASE_PARAMS, micro):
+        np.random.seed(20261006)
+        net = SynapseNetwork(params, shape=(4, 4), variability=0.1)
+        net.apply_spatial_pattern(np.ones((4, 4)), 20, 365, 100,
+                                  mode='potentiation', stimulus_type='light')
+        net.apply_spatial_pattern(np.ones((4, 4)), 20, 550, 50,
+                                  mode='depression', stimulus_type='light')
+        norm.append(np.array([[(s.G - s.G_min) / (s.G_max - s.G_min) for s in row]
+                              for row in net.synapses]))
+    assert np.allclose(norm[0], norm[1], rtol=1e-9, atol=1e-12)
+
+
 def test_the_variation_factor_has_unit_mean_and_the_requested_spread():
     """The GUI control says "percent variability"; it must mean that."""
     np.random.seed(20260731)

@@ -121,6 +121,13 @@ class SynapseNetwork:
                         # every downstream normalisation.
                         params['G_max'] = params['G_min'] * 1.0001
 
+                # A_peak carries units S^(1-alpha): rescale so the exponent spread
+                # shapes the curve on the nominal window without moving the rate.
+                ref = self.base_params
+                W_ref = ref['G_max'] - ref['G_min']
+                params['A_peak'] *= W_ref ** (ref['alpha'] - params['alpha'])
+                params['B_peak'] *= W_ref ** (ref['beta'] - params['beta'])
+
                 # Create synapse with varied parameters
                 synapse = VisualSynapse(
                     G_min=params.get('G_min'),
