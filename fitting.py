@@ -1491,6 +1491,19 @@ def fit_retention_decay(retention_data):
         # R² reported against the data as measured, not the normalised proxy.
         r_squared = _r_squared(conductances, exp_decay(times, tau_fit))
 
+        # Non-decaying data otherwise yield tau ~1e10 s with negative R2.
+        k = max(3, len(conductances) // 10)
+        if np.mean(conductances[-k:]) >= np.mean(conductances[:k]):
+            raise RuntimeError(
+                "Retention data do not decay: the final readings are not below the "
+                "initial ones, so a relaxation time constant is not defined."
+            )
+        if not np.isfinite(r_squared) or r_squared <= 0:
+            raise RuntimeError(
+                f"Retention decay fit explains none of the variance (R2 = {r_squared:.3g}); "
+                f"tau = {tau_fit:.3g} s is not a measurement."
+            )
+
         return {
             'decay_tau_s': float(tau_fit),
             'fit_quality_R2': r_squared,

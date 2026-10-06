@@ -359,3 +359,24 @@ def test_nonlinearity_survives_a_short_noisy_saturating_trace():
 
     result = fitting.fit_nonlinearity_exponent(nonlinearity, G_max=G_max)
     assert 0.4 < result['alpha'] < 1.2
+
+
+def test_rest_integrates_the_full_duration_even_when_not_a_multiple_of_dt():
+    """rest(45, dt=10) used to advance 40 ms and a 1.9 ms stimulus took 1 ms."""
+    syn = VisualSynapse(decay_tau=10.0)
+    syn.rest(45, dt_ms=10.0)
+    assert syn.history_t[-1] == pytest.approx(0.045, abs=1e-12)
+    syn2 = VisualSynapse()
+    syn2.apply_stimulus(1.0, 550, 1.9, dt_ms=1.0)
+    assert syn2.history_t[-1] == pytest.approx(0.0019, abs=1e-12)
+
+
+def test_retention_fit_raises_on_data_that_do_not_decay():
+    """A rising readout must raise, not return tau ~ 4e10 s with negative R2."""
+    t = np.arange(0.0, 7200.0, 5.0)
+    rising = 8e-7 + 7e-8 * (1 - np.exp(-t / 2000.0))
+    with pytest.raises(RuntimeError):
+        fitting.fit_retention_decay(dict(time_s=t, conductance_S=rising, g_initial_S=rising[0]))
+    decaying = 1e-6 + 5e-7 * np.exp(-t / 1500.0)
+    out = fitting.fit_retention_decay(dict(time_s=t, conductance_S=decaying, g_initial_S=decaying[0]))
+    assert out['fit_quality_R2'] > 0.9 and out['decay_tau_s'] > 0

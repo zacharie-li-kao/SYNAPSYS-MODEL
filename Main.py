@@ -407,13 +407,18 @@ class VisualSynapse:
             stimulus_type: 'light' or 'electrical'
             dt_ms: Time step for integration (milliseconds)
         """
-        steps = int(duration_ms / dt_ms)
-        dt_s = dt_ms / 1000.0
+        # Whole steps plus one shortened remainder step, so exactly duration_ms is integrated.
+        n_full = int(np.floor(duration_ms / dt_ms + 1e-9))
+        remainder_ms = duration_ms - n_full * dt_ms
+        if remainder_ms < 1e-9 * max(1.0, duration_ms):
+            remainder_ms = 0.0
+        step_lengths_ms = [dt_ms] * n_full + ([remainder_ms] if remainder_ms > 0 else [])
+        steps = len(step_lengths_ms)
 
         # A stimulus shorter than one integration step used to be a silent
         # no-op: steps == 0, the loop never ran, and the caller got no
         # indication that nothing had happened. Refuse it instead.
-        if steps < 1 and duration_ms > 0:
+        if n_full < 1 and duration_ms > 0:
             raise ValueError(
                 f"Stimulus duration {duration_ms} ms is shorter than the "
                 f"integration step {dt_ms} ms, so no step would be taken. "
@@ -511,7 +516,10 @@ class VisualSynapse:
         
         t_start = self.history_t[-1]
         
+        t_elapsed_ms = 0.0
         for step in range(steps):
+            dt_s = step_lengths_ms[step] / 1000.0
+            t_elapsed_ms += step_lengths_ms[step]
             if actual_mode == 'potentiation':
                 # Potentiation term
                 dG = A_eff * (self.G_max - self.G)**self.alpha * dt_s
@@ -549,7 +557,7 @@ class VisualSynapse:
             # stimulus finish one dt short and duplicated the previous
             # segment's final timestamp as the new segment's first sample.
             self.history_G.append(self.G)
-            self.history_t.append(t_start + (step + 1) * dt_ms / 1000.0)
+            self.history_t.append(t_start + t_elapsed_ms / 1000.0)
             
             # Record stimulus intensity (negative for depression visualization)
             stim_value = intensity_mW_cm2 if actual_mode == 'potentiation' else -intensity_mW_cm2
