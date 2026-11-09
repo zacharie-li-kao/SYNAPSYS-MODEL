@@ -305,8 +305,9 @@ def test_the_loader_reads_the_report_rather_than_defaulting_silently():
 
     import Main
 
-    source = inspect.getsource(
-        Main.SynapseSimulatorApp.load_experimental_synapse_model)
+    # The provenance/display logic lives in _apply_fitted_model, shared with the refit path.
+    source = (inspect.getsource(Main.SynapseSimulatorApp.load_experimental_synapse_model)
+              + inspect.getsource(Main.SynapseSimulatorApp._apply_fitted_model))
 
     assert "resolve_fitted_parameter" in source, (
         "the loader no longer resolves provenance"

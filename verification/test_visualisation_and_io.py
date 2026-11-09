@@ -224,7 +224,7 @@ def test_the_srdp_overlay_accepts_the_prefixed_names_the_fitter_produces():
     srdp_data = {'frequencies_hz': [1.0, 10.0, 100.0],
                  'delta_g_percent': [1.0, 10.0, 19.0]}
     fitted = {'srdp_max_change': 20.0, 'srdp_transition_freq_hz': 10.0,
-              'srdp_slope': 0.3}
+              'srdp_slope': 0.3, 'srdp_baseline': 0.0}
     ax = snnv.plot_srdp_curve(srdp_data, fitted_params=fitted)
     assert ax is not None
 

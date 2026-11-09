@@ -24,7 +24,63 @@ import copy
 # SYNAPSE NETWORK CLASS
 # =============================================================================
 
-class SynapseNetwork:
+class SpatialArrayMixin:
+    """Spatial-pattern interface shared by every network that owns a
+    `self.synapses[i][j]` grid of VisualSynapse objects and a `shape`.
+
+    `current_time` is in SECONDS and `history` is what plot_network_evolution
+    reads; both live here so the two network classes cannot drift apart.
+    """
+
+    def _init_history(self):
+        self.history = {
+            'G_matrices': [self.G_matrix.copy()],
+            'patterns': [np.zeros(self.shape)],
+            'time_points': [0],
+            'pattern_names': ['Initial State']
+        }
+        self.current_time = 0
+
+    def _record_state(self, duration_ms, pattern, pattern_name):
+        self.update_conductance_matrix()
+        self.current_time += duration_ms / 1000.0
+        self.history['G_matrices'].append(self.G_matrix.copy())
+        self.history['patterns'].append(pattern.copy())
+        self.history['time_points'].append(self.current_time)
+        self.history['pattern_names'].append(pattern_name)
+
+    def apply_spatial_pattern(self, pattern, intensity_mW_cm2, wavelength_nm,
+                             duration_ms, mode='potentiation', stimulus_type='light',
+                             pattern_name="Custom"):
+        """
+        Apply a spatial pattern to the network.
+
+        Args:
+            pattern (np.ndarray): N×M binary or continuous pattern (0 to 1)
+            intensity_mW_cm2 (float): Base light intensity (mW/cm²) or voltage (V)
+            wavelength_nm (float): Light wavelength (nm) - ignored for electrical
+            duration_ms (float): Pulse duration
+            mode (str): 'potentiation' or 'depression' - ONLY used for electrical stimuli.
+                       For light stimuli, the wavelength response curve determines the effect.
+            stimulus_type (str): 'light' or 'electrical'
+            pattern_name (str): Name of the pattern for tracking
+        """
+        # Validate pattern shape
+        if pattern.shape != self.shape:
+            raise ValueError(f"Pattern shape {pattern.shape} does not match network shape {self.shape}")
+
+        # Apply stimulus to each synapse based on pattern
+        for i in range(self.shape[0]):
+            for j in range(self.shape[1]):
+                local_intensity = intensity_mW_cm2 * pattern[i, j]
+                self.synapses[i][j].apply_stimulus(
+                    local_intensity, wavelength_nm, duration_ms, mode, stimulus_type
+                )
+
+        self._record_state(duration_ms, pattern, pattern_name)
+
+
+class SynapseNetwork(SpatialArrayMixin):
     """
     A configurable N×M network of visual synapses with device variability.
     
@@ -52,16 +108,8 @@ class SynapseNetwork:
         self.G_matrix = np.zeros(self.shape)
         self.update_conductance_matrix()
         
-        # History tracking
-        self.history = {
-            'G_matrices': [self.G_matrix.copy()],
-            'patterns': [np.zeros(self.shape)],
-            'time_points': [0],
-            'pattern_names': ['Initial State']
-        }
-        
-        self.current_time = 0
-    
+        self._init_history()
+
     @staticmethod
     def _variation_factor(variability):
         """A strictly positive multiplicative variation with unit mean.
@@ -154,57 +202,13 @@ class SynapseNetwork:
             for j in range(self.shape[1]):
                 self.G_matrix[i, j] = self.synapses[i][j].G
     
-    def apply_spatial_pattern(self, pattern, intensity_mW_cm2, wavelength_nm, 
-                             duration_ms, mode='potentiation', stimulus_type='light',
-                             pattern_name="Custom"):
-        """
-        Apply a spatial pattern to the network.
-        
-        Args:
-            pattern (np.ndarray): N×M binary or continuous pattern (0 to 1)
-            intensity_mW_cm2 (float): Base light intensity (mW/cm²) or voltage (V)
-            wavelength_nm (float): Light wavelength (nm) - ignored for electrical
-            duration_ms (float): Pulse duration
-            mode (str): 'potentiation' or 'depression' - ONLY used for electrical stimuli.
-                       For light stimuli, the wavelength response curve determines the effect.
-            stimulus_type (str): 'light' or 'electrical'
-            pattern_name (str): Name of the pattern for tracking
-        """
-        # Validate pattern shape
-        if pattern.shape != self.shape:
-            raise ValueError(f"Pattern shape {pattern.shape} does not match network shape {self.shape}")
-        
-        # Apply stimulus to each synapse based on pattern
-        for i in range(self.shape[0]):
-            for j in range(self.shape[1]):
-                local_intensity = intensity_mW_cm2 * pattern[i, j]
-                self.synapses[i][j].apply_stimulus(
-                    local_intensity, wavelength_nm, duration_ms, mode, stimulus_type
-                )
-        
-        # Update matrix and history
-        self.update_conductance_matrix()
-        self.current_time += duration_ms / 1000.0
-        
-        self.history['G_matrices'].append(self.G_matrix.copy())
-        self.history['patterns'].append(pattern.copy())
-        self.history['time_points'].append(self.current_time)
-        self.history['pattern_names'].append(pattern_name)
-    
-    
     def rest(self, duration_ms):
         """Allow all synapses to rest (decay)."""
         for i in range(self.shape[0]):
             for j in range(self.shape[1]):
                 self.synapses[i][j].rest(duration_ms)
         
-        self.update_conductance_matrix()
-        self.current_time += duration_ms / 1000.0
-        
-        self.history['G_matrices'].append(self.G_matrix.copy())
-        self.history['patterns'].append(np.zeros(self.shape))
-        self.history['time_points'].append(self.current_time)
-        self.history['pattern_names'].append('Rest')
+        self._record_state(duration_ms, np.zeros(self.shape), 'Rest')
     
     def reset(self):
         """Reset all synapses to initial state."""
@@ -213,15 +217,8 @@ class SynapseNetwork:
                 self.synapses[i][j].reset()
         
         self.update_conductance_matrix()
-        self.current_time = 0
-        
-        self.history = {
-            'G_matrices': [self.G_matrix.copy()],
-            'patterns': [np.zeros(self.shape)],
-            'time_points': [0],
-            'pattern_names': ['Initial State']
-        }
-    
+        self._init_history()
+
     def get_statistics(self):
         """Get network statistics."""
         G_flat = self.G_matrix.flatten()
@@ -948,7 +945,7 @@ class LIFNeuron:
 SINGLE_SYNAPSE_DV_FRACTION = 0.10
 
 
-class SpikingSynapseNetwork:
+class SpikingSynapseNetwork(SpatialArrayMixin):
     """
     Spiking neural network with synaptic devices and STDP learning.
 
@@ -1099,8 +1096,30 @@ class SpikingSynapseNetwork:
         self.hidden_spike_history = [[] for _ in range(n_hidden)]
         self.weight_history = []
         self.time_points = []
-        self.current_time = 0.0
-    
+        # Spatial-array interface: a pattern is light falling on the
+        # (n_input, n_hidden) crossbar. `current_time` is seconds (set here);
+        # simulate() keeps its own ms clock in local `t` and never touches it.
+        self._G_initial = self.G_matrix.copy()
+        self._init_history()
+
+    def update_conductance_matrix(self):
+        """G_matrix is derived live from the devices; nothing to refresh."""
+        return self.G_matrix
+
+    def reset(self):
+        """Restore the initial conductances, neuron state and history."""
+        for i, row in enumerate(self.synapses):
+            for j, synapse in enumerate(row):
+                synapse.reset()
+                synapse.G = float(self._G_initial[i, j])
+        for neuron in self.hidden_neurons:
+            neuron.reset()
+        self.input_spike_history = [[] for _ in range(self.n_input)]
+        self.hidden_spike_history = [[] for _ in range(self.n_hidden)]
+        self.weight_history = []
+        self.time_points = []
+        self._init_history()
+
     def get_weight_matrix(self):
         """Get current synaptic weight matrix (conductances in µS)."""
         W = np.zeros((self.n_input, self.n_hidden))
@@ -1162,7 +1181,7 @@ class SpikingSynapseNetwork:
             for synapse in row:
                 if hasattr(synapse, 'rest'):
                     synapse.rest(duration_ms)
-        self.current_time += duration_ms / 1000.0
+        self._record_state(duration_ms, np.zeros(self.shape), 'Rest')
     
     @property
     def stdp_window_ms(self):

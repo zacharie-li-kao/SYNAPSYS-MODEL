@@ -169,6 +169,31 @@ deliberate design, not decoration — do not "simplify" them away.
   readings is not below the first 10%, or R² ≤ 0, instead of returning τ ~ 1e10 s as a success.
   The caller records it in `extraction_report` as a failed fit with `decay_tau` flagged default.
 
+- **Missing readings are gaps, never values.** `DataParser._sanitise_datasets` runs before any
+  estimator: in pulse-train traces a NaN/null reading stays in place (the index is the pulse
+  number, so deleting it would merge two pulses into one increment); in retention/STDP/SRDP the
+  pair is dropped; an all-NaN dataset is excluded. Every case is a warning in the extraction
+  report. Each estimator reads only finite readings. Without this, 5% NaN — which the hardware
+  path writes by design at zero read bias — gave G_max = 1.66 µS (true 99) reported as extracted.
+- **The spectral response has relaxation subtracted.** Retention is fitted before the wavelength
+  response, and `_subtract_relaxation_from_wavelength_response` removes `(G0 − G_min)·t/τ` from
+  each initial rate (same timing basis as the nonlinearity fits), because the device model adds
+  relaxation as its own term. Uncorrected, dark drift read as a −0.1 "response" off-band and the
+  depression band came out ~20% wide. `plot_fitting_results` plots the corrected points.
+- **Closed stimulus vocabulary in the physics.** `VisualSynapse.apply_stimulus` raises on any
+  `stimulus_type` other than `light`/`electrical`, any `mode` other than
+  `potentiation`/`depression`, and negative or non-finite light intensity. A positional-argument
+  slip once passed a pattern name as `stimulus_type`, and the "light" Network Demo silently ran
+  as a 20 V electrical drive.
+- **One STDP source for every simulation.** `Main.resolve_stdp_parameters` is the only rule:
+  fitted values only when `'stdp'` is in `extraction_report['extracted']`, otherwise the
+  documented defaults with the reason stated. Both the SNN tab and the Network tab's spiking
+  mode use it. Plots draw the fitted models through the same functions the fits use
+  (`stdp_window_percent`, `srdp_sigmoid_percent`) — never a re-typed formula or scale factor.
+- **Both network classes share the spatial interface** (`network.SpatialArrayMixin`:
+  `history`, `current_time` in seconds, `apply_spatial_pattern`), so the Network tab works the
+  same in rate and spiking mode.
+
 ## Verification
 
 `python -m pytest verification/ -q` — ~5 s, no hardware, no GUI. Proves the

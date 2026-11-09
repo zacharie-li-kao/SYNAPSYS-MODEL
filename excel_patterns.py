@@ -33,30 +33,25 @@ class ExcelPatternLoader:
         Returns:
             float: Intensity value where 0.0 = white/no fill, 1.0 = black
         """
-        if rgb_color is None or rgb_color == '00000000':
-            # No fill or completely transparent = 0 (no stimulation)
+        if rgb_color is None:
+            # No colour = no stimulation. '00000000' is black on a solid fill (openpyxl writes it), not transparent.
             return 0.0
         
-        # Extract RGB components (format is typically 'AARRGGBB')
-        if len(rgb_color) >= 6:
-            # Take last 6 characters for RGB
-            rgb_hex = rgb_color[-6:]
-            try:
-                r = int(rgb_hex[0:2], 16)
-                g = int(rgb_hex[2:4], 16)
-                b = int(rgb_hex[4:6], 16)
-                
-                # Convert to grayscale using standard luminance formula
-                grayscale = 0.299 * r + 0.587 * g + 0.114 * b
-                
-                # Invert: black (0) -> 1.0, white (255) -> 0.0
-                intensity = 1.0 - (grayscale / 255.0)
-                
-                return intensity
-            except ValueError:
-                return 0.0
-        
-        return 0.0
+        # 'AARRGGBB' (or 'RRGGBB'); only the RGB part carries intensity.
+        rgb_hex = str(rgb_color)[-6:]
+        try:
+            if len(str(rgb_color)) < 6:
+                raise ValueError("fewer than 6 hex digits")
+            r = int(rgb_hex[0:2], 16)
+            g = int(rgb_hex[2:4], 16)
+            b = int(rgb_hex[4:6], 16)
+        except ValueError as e:
+            # A colour that cannot be read is not "no stimulation".
+            raise ValueError(f"unreadable cell colour {rgb_color!r}: {e}") from None
+
+        # Luminance, inverted: black (0) -> 1.0, white (255) -> 0.0
+        grayscale = 0.299 * r + 0.587 * g + 0.114 * b
+        return 1.0 - (grayscale / 255.0)
     
     @staticmethod
     def load_pattern_from_excel(filepath, max_size=500):

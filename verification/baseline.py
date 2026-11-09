@@ -86,13 +86,16 @@ BASELINE = {
     "lambda_width": dict(status=PINNED, truth=30.0, baseline=31.74, rel_tol=0.25),
     "lambda_pot_peak_nm": dict(status=PINNED, truth=365.0, baseline=364.11, rel_tol=0.05),
     "lambda_pot_width_nm": dict(status=PINNED, truth=30.0, baseline=31.74, rel_tol=0.25),
-    "lambda_dep_peak_nm": dict(status=PINNED, truth=550.0, baseline=548.37, rel_tol=0.05),
+    "lambda_dep_peak_nm": dict(status=PINNED, truth=550.0, baseline=549.8, rel_tol=0.05),
     # The audit's headline failure: 48.87 nm against a true 30 nm, because the
     # response was read at a fixed pulse count by which the depression runs had
     # bottomed out. Now measured from dG/dn|0. The tolerance is 25% rather than
     # tighter because the depression traces carry the least signal in the suite
     # — see depression_nonlinearity_fit_R2 below.
-    "lambda_dep_width_nm": dict(status=PINNED, truth=30.0, baseline=34.78, rel_tol=0.25),
+    # 34.78 nm (+16%) until the dark relaxation of each trace was subtracted
+    # from its initial rate (2026-11-09): that drift read as a -0.1 "response"
+    # off-band and widened the band. Now -7.7%; tolerance tightened.
+    "lambda_dep_width_nm": dict(status=PINNED, truth=30.0, baseline=27.68, rel_tol=0.15),
 
     # --- retention ---
     "decay_tau": dict(status=PINNED, truth=100.0, baseline=103.00, rel_tol=0.20),
@@ -100,7 +103,7 @@ BASELINE = {
     # --- rate constants ---
     # B_peak was the audit's worst failure: 16.7x, railed at the optimiser's
     # upper bound and reported as a successful extraction. Now +5%.
-    "B_peak": dict(status=PINNED, truth=6e-4, baseline=6.320e-4, rel_tol=0.20),
+    "B_peak": dict(status=PINNED, truth=6e-4, baseline=6.033e-4, rel_tol=0.20),
 
     # A_peak amplifies alpha's residual error through the power-law prefactor —
     # the base (G_max - G) is ~1e-4, so a percent of exponent error becomes
@@ -111,10 +114,10 @@ BASELINE = {
                         "power-law prefactor"),
 
     # --- fit quality ---
-    "wavelength_fit_R2": dict(status=PINNED, truth=1.0, baseline=0.9717, min_value=0.90),
+    "wavelength_fit_R2": dict(status=PINNED, truth=1.0, baseline=0.9774, min_value=0.90),
     "nonlinearity_fit_R2": dict(status=PINNED, truth=1.0, baseline=0.9365, min_value=0.85),
     "retention_fit_R2": dict(status=PINNED, truth=1.0, baseline=0.9988, min_value=0.95),
-    "srdp_fit_R2": dict(status=PINNED, truth=1.0, baseline=0.9886, min_value=0.95),
+    "srdp_fit_R2": dict(status=PINNED, truth=1.0, baseline=0.9932, min_value=0.95),
     "stdp_fit_R2": dict(status=PINNED, truth=1.0, baseline=0.8668, min_value=0.75),
     # Lower than the others because the depression traces move little now that
     # the undeclared x10 is gone, so noise is a larger fraction of the signal.

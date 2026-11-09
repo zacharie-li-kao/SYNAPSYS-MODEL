@@ -39,7 +39,7 @@ from snn_visualization import (generate_poisson_spike_trains, visualize_snn_simu
                                plot_weight_evolution, plot_firing_rates)
 
 import json
-from tkinter.filedialog import askopenfilename
+from tkinter.filedialog import askopenfilename, asksaveasfilename
 from tkinter import messagebox as tk_messagebox
 
 # Set appearance
@@ -407,6 +407,17 @@ class VisualSynapse:
             stimulus_type: 'light' or 'electrical'
             dt_ms: Time step for integration (milliseconds)
         """
+        # Closed vocabularies: an unknown stimulus_type used to fall through to the
+        # electrical branch and run as a voltage drive instead of failing.
+        if stimulus_type not in ('light', 'electrical'):
+            raise ValueError(f"Unknown stimulus_type {stimulus_type!r}; expected 'light' or 'electrical'.")
+        if mode not in ('potentiation', 'depression'):
+            raise ValueError(f"Unknown mode {mode!r}; expected 'potentiation' or 'depression'.")
+        if not np.isfinite(intensity_mW_cm2):
+            raise ValueError(f"Stimulus intensity must be finite, got {intensity_mW_cm2!r}.")
+        if stimulus_type == 'light' and intensity_mW_cm2 < 0:
+            raise ValueError(f"Light intensity cannot be negative (got {intensity_mW_cm2} mW/cm²).")
+
         # Whole steps plus one shortened remainder step, so exactly duration_ms is integrated.
         n_full = int(np.floor(duration_ms / dt_ms + 1e-9))
         remainder_ms = duration_ms - n_full * dt_ms
@@ -586,6 +597,135 @@ class VisualSynapse:
     def read_current(self, V_read=0.1):
         """Read synapse current at given voltage (like hardware)."""
         return self.G * V_read
+
+
+# =============================================================================
+# GUI-INDEPENDENT HELPERS (module level so they can be tested without Tk)
+# =============================================================================
+
+# Documented library defaults (CLAUDE.md). A_plus/A_minus are percent of the
+# dynamic range and are passed through undivided.
+DEFAULT_STDP_PARAMS = {
+    'stdp_A_plus': 0.5,
+    'stdp_A_minus': 0.3,
+    'stdp_tau_plus_ms': 20.0,
+    'stdp_tau_minus_ms': 20.0,
+}
+
+
+def resolve_stdp_parameters(fitted_model):
+    """Return (stdp_params, description) from ONE rule for every consumer.
+
+    Fitted values are used only when the extraction report says the STDP window
+    was extracted. fitting.py also stores default values under the same keys
+    when STDP data is absent or its fit failed, so key presence says nothing
+    about whether they were measured. The description states which case applies.
+    """
+    if not fitted_model:
+        reason = "no fitted model is loaded"
+    else:
+        report = fitted_model.get('extraction_report') or {}
+        if 'stdp' in report.get('extracted', []):
+            params = {k: float(fitted_model[k]) for k in DEFAULT_STDP_PARAMS}
+            return params, (
+                f"Using fitted STDP parameters (A+={params['stdp_A_plus']:.3f}%, "
+                f"A-={params['stdp_A_minus']:.3f}% of dynamic range, "
+                f"tau+={params['stdp_tau_plus_ms']:.1f} ms, "
+                f"tau-={params['stdp_tau_minus_ms']:.1f} ms)\n")
+        if 'stdp' in report.get('failed', []):
+            reason = "the STDP fit failed"
+        elif 'stdp_params' in report.get('defaults_used', []):
+            reason = "the loaded model carries no STDP measurement"
+        else:
+            reason = "the loaded model's extraction report records no STDP extraction"
+    d = DEFAULT_STDP_PARAMS
+    return dict(d), (
+        f"Using DEFAULT STDP parameters ({reason}): A+={d['stdp_A_plus']}%, "
+        f"A-={d['stdp_A_minus']}% of dynamic range, tau+={d['stdp_tau_plus_ms']:.0f} ms, "
+        f"tau-={d['stdp_tau_minus_ms']:.0f} ms.\n"
+        "These are library defaults, NOT measured from your device.\n")
+
+
+def pick_branch_wavelengths(synapse, step_nm=1.0):
+    """(potentiation, depression) wavelengths of a FITTED signed curve.
+
+    Each is (wavelength_nm, S) at the extremum of wavelength_sensitivity over
+    the synapse's wavelength_range, or None when that branch does not exist
+    (no positive / no negative response anywhere in the range).
+    """
+    if synapse.wavelength_curve is None:
+        raise ValueError("pick_branch_wavelengths needs a fitted wavelength curve; "
+                         "the unfitted Gaussian is unsigned and has no branches.")
+    lo, hi = synapse.wavelength_range
+    grid = np.arange(lo, hi + step_nm / 2, step_nm)
+    s = np.array([synapse.wavelength_sensitivity(w) for w in grid], dtype=float)
+    i_pot, i_dep = int(np.argmax(s)), int(np.argmin(s))
+    pot = (float(grid[i_pot]), float(s[i_pot])) if s[i_pot] > 0 else None
+    dep = (float(grid[i_dep]), float(s[i_dep])) if s[i_dep] < 0 else None
+    return pot, dep
+
+
+def describe_branch(requested_mode, report):
+    """One line saying which branch ran, given VisualSynapse.last_stimulus_report."""
+    if report is None or report['requested_mode'] == report['actual_mode']:
+        return f"ran as requested ({requested_mode})"
+    return (f"OVERRIDE: requested {report['requested_mode']}, "
+            f"ran {report['actual_mode']} ({report['reason']})")
+
+
+def summarise_branch_overrides(synapses, pattern):
+    """(n_lit, overrides) for the last stimulus applied to a synapse grid.
+
+    Only synapses with pattern > 0 are considered: an unlit pixel has zero drive,
+    so its branch is meaningless. `overrides` is a list of dicts
+    {requested, actual, count, reason}, one per (requested, actual) pair.
+    """
+    groups = {}
+    n_lit = 0
+    for i, row in enumerate(synapses):
+        for j, syn in enumerate(row):
+            if not pattern[i][j] > 0:
+                continue
+            n_lit += 1
+            r = syn.last_stimulus_report
+            if r is not None and r['requested_mode'] != r['actual_mode']:
+                g = groups.setdefault((r['requested_mode'], r['actual_mode']),
+                                      {'requested': r['requested_mode'],
+                                       'actual': r['actual_mode'],
+                                       'count': 0, 'reason': r['reason']})
+                g['count'] += 1
+    return n_lit, list(groups.values())
+
+
+def parse_snn_run_inputs(n_input, n_hidden, rate_hz, duration_ms):
+    """Validate the SNN tab's raw entries; return (n_input, n_hidden, rate_hz, duration_ms)."""
+    def whole(label, raw):
+        try:
+            value = int(str(raw).strip())
+        except ValueError:
+            raise ValueError(f"{label} must be a whole number, got {raw!r}.") from None
+        if value < 1:
+            raise ValueError(f"{label} must be at least 1, got {value}.")
+        return value
+
+    def real(label, raw):
+        try:
+            value = float(str(raw).strip())
+        except ValueError:
+            raise ValueError(f"{label} must be a number, got {raw!r}.") from None
+        if not np.isfinite(value):
+            raise ValueError(f"{label} must be finite, got {raw!r}.")
+        return value
+
+    n_in = whole("Input Neurons", n_input)
+    n_hid = whole("Hidden Neurons", n_hidden)
+    rate = real("Input rate (Hz)", rate_hz)
+    dur = real("Duration (ms)", duration_ms)
+    if rate < 0:
+        raise ValueError(f"Input rate (Hz) cannot be negative, got {rate}.")
+    if dur <= 0:
+        raise ValueError(f"Duration (ms) must be greater than 0, got {dur}.")
+    return n_in, n_hid, rate, dur
 
 
 # =============================================================================
@@ -1203,6 +1343,17 @@ class SynapseSimulatorApp(ctk.CTk):
             font=("Arial", 12, "bold")
         )
         load_exp_button.pack(fill="x", padx=10)
+
+        save_model_button = ctk.CTkButton(
+            button_frame,
+            text="💾 Save Fitted Model",
+            command=self.save_fitted_model_to_file,
+            fg_color="#2E7D32",
+            hover_color="#1B5E20",
+            height=40,
+            font=("Arial", 12, "bold")
+        )
+        save_model_button.pack(fill="x", padx=10, pady=(6, 0))
         
         # Info label for button
         info_label = ctk.CTkLabel(
@@ -1328,196 +1479,10 @@ class SynapseSimulatorApp(ctk.CTk):
                 )
                 return None
             
-            # Convert to base_params format (standardized parameter names).
-            #
-            # C8: every key used to be read with .get(key, <hardcoded default>)
-            # and no presence check, after which the GUI printed
-            # "Experimental parameters applied to synapse model" regardless. A
-            # decay_tau that was never measured was displayed identically to a
-            # genuinely fitted G_min. `fitting.py` produces exactly the
-            # diagnostics needed to prevent this — per-fit R² values and an
-            # extraction_report whose entire purpose is to flag fallbacks — and
-            # none of them were read.
-            #
-            # Each parameter is now resolved through _resolve_param, which
-            # records where the value came from so the display can say so.
-            provenance = {}
-
-            # The extraction report itself, bound once here. Every consumer
-            # below reads THIS name; it was previously referenced without ever
-            # being assigned, which raised NameError on every single load and
-            # skipped the whole tail of this method — including the line that
-            # actually applies the fitted parameters to the synapse.
-            report = fitted_model.get('extraction_report') or {}
-
-            def _resolve_param(key, default, report_names=()):
-                value, state = resolve_fitted_parameter(
-                    fitted_model, key, default, report_names)
-                provenance[key] = state
-                return value
-
-            base_params = {
-                'G_min': _resolve_param('G_min', 1e-6, ('G_min', 'dynamic_range')),
-                'G_max': _resolve_param('G_max', 1e-4, ('G_max', 'dynamic_range')),
-                'alpha': _resolve_param('alpha', 0.8, ('alpha', 'nonlinearity')),
-                'beta': _resolve_param('beta', 0.8, ('beta',)),
-                'lambda_peak': _resolve_param('lambda_peak', 550,
-                                              ('lambda_peak', 'wavelength_response')),
-                'lambda_width': _resolve_param('lambda_width', 100,
-                                               ('lambda_width', 'wavelength_response')),
-                'A_peak': _resolve_param('A_peak', 8e-4),
-                'B_peak': _resolve_param('B_peak', 6e-4),
-                'decay_tau': _resolve_param('decay_tau', 100, ('decay_tau', 'retention')),
-                'wavelength_curve': fitted_model.get('wavelength_curve'),
-                'wavelength_range': fitted_model.get('wavelength_range', [200, 2000])
-            }
-
-            # Display loaded parameters
-            self.fitting_results_text.insert("end",
-                "\n" + "=" * 60 + "\n"
-                + "EXPERIMENTAL SYNAPSE PARAMETERS LOADED\n"
-                + "=" * 60 + "\n"
-            )
-
-            def _tag(key):
-                state = provenance.get(key, 'fitted')
-                if state == 'fitted':
-                    return ''
-                if state == 'MISSING':
-                    return '   <-- NOT IN FILE, hardcoded default substituted'
-                if state == 'FAILED':
-                    return '   <-- FIT FAILED, value is not trustworthy'
-                return '   <-- DEFAULT, not measured'
-
-            self.fitting_results_text.insert("end",
-                f"Source file: {json_path.split('/')[-1]}\n\n"
-                f"Loaded Parameters:\n"
-                f"  G_min:        {base_params['G_min']*1e6:.2f} µS{_tag('G_min')}\n"
-                f"  G_max:        {base_params['G_max']*1e6:.2f} µS{_tag('G_max')}\n"
-                f"  On/Off Ratio: {base_params['G_max']/base_params['G_min']:.1f}:1\n"
-                f"  alpha:        {base_params['alpha']:.3f}{_tag('alpha')}\n"
-                f"  beta:         {base_params['beta']:.3f}{_tag('beta')}\n"
-                f"  A_peak:       {base_params['A_peak']:.3e}{_tag('A_peak')}\n"
-                f"  B_peak:       {base_params['B_peak']:.3e}{_tag('B_peak')}\n"
-                f"  lambda_peak:  {base_params['lambda_peak']:.1f} nm{_tag('lambda_peak')}\n"
-                f"  lambda_width: {base_params['lambda_width']:.1f} nm{_tag('lambda_width')}\n"
-                f"  decay_tau:    {base_params['decay_tau']:.1f} s{_tag('decay_tau')}\n\n"
-            )
-
-            # Fit quality, which the GUI previously discarded entirely.
-            r2_keys = [
-                ('wavelength_fit_R2', 'Wavelength response'),
-                ('nonlinearity_fit_R2', 'Nonlinearity (alpha)'),
-                ('depression_nonlinearity_fit_R2', 'Depression nonlinearity (beta)'),
-                ('retention_fit_R2', 'Retention (decay_tau)'),
-                ('stdp_fit_R2', 'STDP window'),
-                ('srdp_fit_R2', 'SRDP response'),
-            ]
-            reported_r2 = [(label, fitted_model[k]) for k, label in r2_keys
-                           if fitted_model.get(k) is not None]
-            if reported_r2:
-                self.fitting_results_text.insert("end", "Fit quality (R²):\n")
-                for label, value in reported_r2:
-                    if value != value:  # NaN
-                        note = '   <-- UNDEFINED (constant data)'
-                    elif value < 0.8:
-                        note = '   <-- POOR'
-                    else:
-                        note = ''
-                    self.fitting_results_text.insert(
-                        "end", f"  {label:32s} {value:.4f}{note}\n"
-                    )
-                self.fitting_results_text.insert("end", "\n")
-
-            # The extraction report, surfaced rather than discarded.
-            substituted = sorted(k for k, v in provenance.items() if v != 'fitted')
-            if substituted or report.get('failed') or report.get('warnings'):
-                self.fitting_results_text.insert(
-                    "end",
-                    "-" * 60 + "\n"
-                    + "NOT EVERYTHING IN THIS MODEL WAS MEASURED\n"
-                    + "-" * 60 + "\n"
-                )
-                if substituted:
-                    self.fitting_results_text.insert(
-                        "end",
-                        f"  Substituted or unfitted: {', '.join(substituted)}\n"
-                    )
-                for item in report.get('failed', []):
-                    self.fitting_results_text.insert("end", f"  FAILED: {item}\n")
-                for warning in report.get('warnings', []):
-                    self.fitting_results_text.insert("end", f"  ! {warning}\n")
-                self.fitting_results_text.insert("end", "\n")
-
-            self.loaded_param_provenance = provenance
-            # Remembered so every tab's status line can name the source file
-            # rather than just asserting "experimental".
-            try:
-                self.loaded_model_source = os.path.basename(json_path)
-            except Exception:
-                self.loaded_model_source = 'loaded model'
-
-            # Always update the synapse with experimental parameters
-            self.synapse = VisualSynapse(
-                G_min=base_params['G_min'],
-                G_max=base_params['G_max'],
-                alpha=base_params['alpha'],
-                beta=base_params['beta'],
-                lambda_peak=base_params['lambda_peak'],
-                lambda_width=base_params['lambda_width'],
-                decay_tau=base_params['decay_tau'],
-                A_peak=base_params['A_peak'],
-                B_peak=base_params['B_peak'],
-                wavelength_curve=fitted_model.get('wavelength_curve'),
-                wavelength_range=base_params['wavelength_range']
-            )
-            
-            # Mark that we're using experimental parameters
-            self.using_experimental_params = True
-            
-            # Store the loaded data for fitting visualization
-            self.loaded_experimental_data = data
-            self.loaded_experimental_params = base_params
-            self.loaded_fitted_model = fitted_model  # Store full fitted model with all metrics
-            
-            # Reports what was actually applied. This used to be an
-            # unconditional "✓ Experimental parameters applied", printed
-            # identically whether every parameter had been fitted or every one
-            # had been silently defaulted.
-            n_fitted = sum(1 for v in provenance.values() if v == 'fitted')
-            n_total = len(provenance)
-            if n_fitted == n_total:
-                headline = f"All {n_total} parameters applied from measured data.\n"
-            else:
-                headline = (
-                    f"{n_fitted} of {n_total} parameters came from measured "
-                    f"data; the remaining {n_total - n_fitted} are substituted "
-                    "values, marked above.\n"
-                )
-
-            self.fitting_results_text.insert("end",
-                headline +
-                "  - Synapse calculations will now use these parameters\n"
-                "  - Network initialization will use these parameters\n"
-                "  - Click 'Run Fitting' to visualize the fit\n\n"
-            )
-            
-            # Update wavelength slider range based on loaded data
-            wl_range = base_params['wavelength_range']
-            self.wavelength_slider.configure(from_=wl_range[0], to=wl_range[1])
-            # Set to middle of range if current value is outside
-            current_wl = self.wavelength_slider.get()
-            if current_wl < wl_range[0] or current_wl > wl_range[1]:
-                self.wavelength_slider.set((wl_range[0] + wl_range[1]) / 2)
-                self.update_wavelength_label(self.wavelength_slider.get())
-            
-            # Update plots
-            self.update_plots()
-            self.update_info()
-            
-            # Update the fitting button text
-            self.btn_fitting.configure(text="Run Fitting")
-            
+            base_params = self._apply_fitted_model(
+                fitted_model, data, os.path.basename(json_path))
+            if base_params is not None:
+                self.btn_fitting.configure(text="Run Fitting")
             return base_params
             
         except json.JSONDecodeError:
@@ -1535,6 +1500,238 @@ class SynapseSimulatorApp(ctk.CTk):
             return None
     
     
+    def save_fitted_model_to_file(self):
+        """Save the loaded fitted model as JSON (reloadable via 'fitted_model_format')."""
+        if self.loaded_fitted_model is None:
+            tk_messagebox.showerror(
+                "No Model",
+                "No fitted model is loaded. Load a characterization suite or "
+                "fitted model first.")
+            return
+        path = asksaveasfilename(
+            title="Save Fitted Model",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
+        if not path:
+            return  # cancelled
+        try:
+            from fitting import save_fitted_model
+            save_fitted_model(self.loaded_fitted_model, path)
+        except Exception as e:
+            tk_messagebox.showerror("Save Error", f"Failed to save fitted model:\n{e}")
+            return
+        self.fitting_results_text.insert("end", f"\n✓ Fitted model saved to {path}\n")
+
+    def _apply_fitted_model(self, fitted_model, data, source_name):
+        """Turn a fitted_model into a VisualSynapse and make it the active device.
+
+        Shared by the file loader and by the forced-peak-count refit in
+        on_fitting_demo, so the simulation never keeps a spectral curve the
+        Model Fitting tab no longer shows. Returns base_params, or None when
+        nothing in the model was measured (nothing is changed in that case).
+        """
+        # Convert to base_params format (standardized parameter names).
+        #
+        # C8: every key used to be read with .get(key, <hardcoded default>)
+        # and no presence check, after which the GUI printed
+        # "Experimental parameters applied to synapse model" regardless. A
+        # decay_tau that was never measured was displayed identically to a
+        # genuinely fitted G_min. `fitting.py` produces exactly the
+        # diagnostics needed to prevent this — per-fit R² values and an
+        # extraction_report whose entire purpose is to flag fallbacks — and
+        # none of them were read.
+        #
+        # Each parameter is now resolved through _resolve_param, which
+        # records where the value came from so the display can say so.
+        provenance = {}
+
+        # The extraction report itself, bound once here. Every consumer
+        # below reads THIS name; it was previously referenced without ever
+        # being assigned, which raised NameError on every single load and
+        # skipped the whole tail of this method — including the line that
+        # actually applies the fitted parameters to the synapse.
+        report = fitted_model.get('extraction_report') or {}
+
+        def _resolve_param(key, default, report_names=()):
+            value, state = resolve_fitted_parameter(
+                fitted_model, key, default, report_names)
+            provenance[key] = state
+            return value
+
+        base_params = {
+            'G_min': _resolve_param('G_min', 1e-6, ('G_min', 'dynamic_range')),
+            'G_max': _resolve_param('G_max', 1e-4, ('G_max', 'dynamic_range')),
+            'alpha': _resolve_param('alpha', 0.8, ('alpha', 'nonlinearity')),
+            'beta': _resolve_param('beta', 0.8, ('beta',)),
+            'lambda_peak': _resolve_param('lambda_peak', 550,
+                                          ('lambda_peak', 'wavelength_response')),
+            'lambda_width': _resolve_param('lambda_width', 100,
+                                           ('lambda_width', 'wavelength_response')),
+            'A_peak': _resolve_param('A_peak', 8e-4),
+            'B_peak': _resolve_param('B_peak', 6e-4),
+            'decay_tau': _resolve_param('decay_tau', 100, ('decay_tau', 'retention')),
+            'wavelength_curve': fitted_model.get('wavelength_curve'),
+            'wavelength_range': fitted_model.get('wavelength_range', [200, 2000])
+        }
+
+        # A file that yields no measured parameter at all (e.g. an empty
+        # `datasets` list) would otherwise become an all-defaults "experimental"
+        # device, indistinguishable on screen from a real one.
+        if not any(state == 'fitted' for state in provenance.values()):
+            tk_messagebox.showerror(
+                "Nothing Measured",
+                f"'{source_name}' yielded no fitted parameter: every value would "
+                "be a substituted default.\n\nThe current synapse model has been "
+                "left unchanged."
+            )
+            self.fitting_results_text.insert(
+                "end", f"\n✗ {source_name}: no parameter could be extracted; "
+                "model not loaded.\n\n")
+            return None
+
+        # Display loaded parameters
+        self.fitting_results_text.insert("end",
+            "\n" + "=" * 60 + "\n"
+            + "EXPERIMENTAL SYNAPSE PARAMETERS LOADED\n"
+            + "=" * 60 + "\n"
+        )
+
+        def _tag(key):
+            state = provenance.get(key, 'fitted')
+            if state == 'fitted':
+                return ''
+            if state == 'MISSING':
+                return '   <-- NOT IN FILE, hardcoded default substituted'
+            if state == 'FAILED':
+                return '   <-- FIT FAILED, value is not trustworthy'
+            return '   <-- DEFAULT, not measured'
+
+        self.fitting_results_text.insert("end",
+            f"Source file: {source_name}\n\n"
+            f"Loaded Parameters:\n"
+            f"  G_min:        {base_params['G_min']*1e6:.2f} µS{_tag('G_min')}\n"
+            f"  G_max:        {base_params['G_max']*1e6:.2f} µS{_tag('G_max')}\n"
+            f"  On/Off Ratio: {base_params['G_max']/base_params['G_min']:.1f}:1\n"
+            f"  alpha:        {base_params['alpha']:.3f}{_tag('alpha')}\n"
+            f"  beta:         {base_params['beta']:.3f}{_tag('beta')}\n"
+            f"  A_peak:       {base_params['A_peak']:.3e}{_tag('A_peak')}\n"
+            f"  B_peak:       {base_params['B_peak']:.3e}{_tag('B_peak')}\n"
+            f"  lambda_peak:  {base_params['lambda_peak']:.1f} nm{_tag('lambda_peak')}\n"
+            f"  lambda_width: {base_params['lambda_width']:.1f} nm{_tag('lambda_width')}\n"
+            f"  decay_tau:    {base_params['decay_tau']:.1f} s{_tag('decay_tau')}\n\n"
+        )
+
+        # Fit quality, which the GUI previously discarded entirely.
+        r2_keys = [
+            ('wavelength_fit_R2', 'Wavelength response'),
+            ('nonlinearity_fit_R2', 'Nonlinearity (alpha)'),
+            ('depression_nonlinearity_fit_R2', 'Depression nonlinearity (beta)'),
+            ('retention_fit_R2', 'Retention (decay_tau)'),
+            ('stdp_fit_R2', 'STDP window'),
+            ('srdp_fit_R2', 'SRDP response'),
+        ]
+        reported_r2 = [(label, fitted_model[k]) for k, label in r2_keys
+                       if fitted_model.get(k) is not None]
+        if reported_r2:
+            self.fitting_results_text.insert("end", "Fit quality (R²):\n")
+            for label, value in reported_r2:
+                if value != value:  # NaN
+                    note = '   <-- UNDEFINED (constant data)'
+                elif value < 0.8:
+                    note = '   <-- POOR'
+                else:
+                    note = ''
+                self.fitting_results_text.insert(
+                    "end", f"  {label:32s} {value:.4f}{note}\n"
+                )
+            self.fitting_results_text.insert("end", "\n")
+
+        # The extraction report, surfaced rather than discarded.
+        substituted = sorted(k for k, v in provenance.items() if v != 'fitted')
+        if substituted or report.get('failed') or report.get('warnings'):
+            self.fitting_results_text.insert(
+                "end",
+                "-" * 60 + "\n"
+                + "NOT EVERYTHING IN THIS MODEL WAS MEASURED\n"
+                + "-" * 60 + "\n"
+            )
+            if substituted:
+                self.fitting_results_text.insert(
+                    "end",
+                    f"  Substituted or unfitted: {', '.join(substituted)}\n"
+                )
+            for item in report.get('failed', []):
+                self.fitting_results_text.insert("end", f"  FAILED: {item}\n")
+            for warning in report.get('warnings', []):
+                self.fitting_results_text.insert("end", f"  ! {warning}\n")
+            self.fitting_results_text.insert("end", "\n")
+
+        self.loaded_param_provenance = provenance
+        # Remembered so every tab's status line can name the source file
+        # rather than just asserting "experimental".
+        self.loaded_model_source = source_name
+
+        # Always update the synapse with experimental parameters
+        self.synapse = VisualSynapse(
+            G_min=base_params['G_min'],
+            G_max=base_params['G_max'],
+            alpha=base_params['alpha'],
+            beta=base_params['beta'],
+            lambda_peak=base_params['lambda_peak'],
+            lambda_width=base_params['lambda_width'],
+            decay_tau=base_params['decay_tau'],
+            A_peak=base_params['A_peak'],
+            B_peak=base_params['B_peak'],
+            wavelength_curve=fitted_model.get('wavelength_curve'),
+            wavelength_range=base_params['wavelength_range']
+        )
+        
+        # Mark that we're using experimental parameters
+        self.using_experimental_params = True
+        
+        # Store the loaded data for fitting visualization
+        self.loaded_experimental_data = data
+        self.loaded_experimental_params = base_params
+        self.loaded_fitted_model = fitted_model  # Store full fitted model with all metrics
+        
+        # Reports what was actually applied. This used to be an
+        # unconditional "✓ Experimental parameters applied", printed
+        # identically whether every parameter had been fitted or every one
+        # had been silently defaulted.
+        n_fitted = sum(1 for v in provenance.values() if v == 'fitted')
+        n_total = len(provenance)
+        if n_fitted == n_total:
+            headline = f"All {n_total} parameters applied from measured data.\n"
+        else:
+            headline = (
+                f"{n_fitted} of {n_total} parameters came from measured "
+                f"data; the remaining {n_total - n_fitted} are substituted "
+                "values, marked above.\n"
+            )
+
+        self.fitting_results_text.insert("end",
+            headline +
+            "  - Synapse calculations will now use these parameters\n"
+            "  - Network initialization will use these parameters\n"
+            "  - Click 'Run Fitting' to visualize the fit\n\n"
+        )
+        
+        # Update wavelength slider range based on loaded data
+        wl_range = base_params['wavelength_range']
+        self.wavelength_slider.configure(from_=wl_range[0], to=wl_range[1])
+        # Set to middle of range if current value is outside
+        current_wl = self.wavelength_slider.get()
+        if current_wl < wl_range[0] or current_wl > wl_range[1]:
+            self.wavelength_slider.set((wl_range[0] + wl_range[1]) / 2)
+            self.update_wavelength_label(self.wavelength_slider.get())
+        
+        # Update plots
+        self.update_plots()
+        self.update_info()
+        
+        return base_params
+
+
     def setup_network_tab(self, parent):
         """Setup the 3×3 network simulation tab."""
         
@@ -1726,9 +1923,9 @@ class SynapseSimulatorApp(ctk.CTk):
                                         fg_color="#2E7D32", hover_color="#1B5E20")
             # Hide stimulus type selector
             self.stimulus_type_frame.pack_forget()
-            # Ensure wavelength controls are visible
-            self.wavelength_slider.configure(state="normal")
-            self.wavelength_label.configure(text_color=("gray10", "gray90"))
+            # Potentiation is always light: undo a depression-electrical voltage
+            # slider, which would otherwise feed a negative "intensity" to the light path.
+            self._configure_light_controls()
         else:
             self.btn_stimulate.configure(text="Apply Depression", 
                                         fg_color="#FF6F00", hover_color="#E65100")
@@ -1837,19 +2034,26 @@ class SynapseSimulatorApp(ctk.CTk):
         self.n_pulses_label.configure(text=f"{n} pulse{'s' if n > 1 else ''}")
         
     
+    def _configure_light_controls(self):
+        """Wavelength enabled and the intensity slider in its light (mW/cm²) configuration."""
+        # Only a slider still in voltage configuration (negative lower bound) needs
+        # its value reset; a light intensity the user chose is kept.
+        was_voltage = self.intensity_slider.cget("from_") < 0
+        self.wavelength_slider.configure(state="normal")
+        self.wavelength_label.configure(text_color=("gray10", "gray90"))
+        # Light intensity (0.1 to 100 mW/cm²)
+        self.intensity_slider.configure(from_=0.1, to=100)
+        if was_voltage:
+            self.intensity_slider.set(10)
+        self.intensity_static_label.configure(text="Intensity (mW/cm²):")
+        self.intensity_label.configure(text=f"{self.intensity_slider.get():.1f} mW/cm²")
+
     def on_stimulus_type_change(self):
         """Handle stimulus type change between light and electrical."""
         stim_type = self.stimulus_type_var.get()
         
         if stim_type == "light":
-            # Enable wavelength control
-            self.wavelength_slider.configure(state="normal")
-            self.wavelength_label.configure(text_color=("gray10", "gray90"))
-            # Reconfigure slider for light intensity (0.1 to 100 mW/cm²)
-            self.intensity_slider.configure(from_=0.1, to=100)
-            self.intensity_slider.set(10)
-            self.intensity_static_label.configure(text="Intensity (mW/cm²):")
-            self.intensity_label.configure(text=f"{self.intensity_slider.get():.1f} mW/cm²")
+            self._configure_light_controls()
         else:
             # Disable wavelength control (not used for electrical)
             self.wavelength_slider.configure(state="disabled")
@@ -1957,6 +2161,8 @@ class SynapseSimulatorApp(ctk.CTk):
                 )
                 if response:
                     self.on_network_init()  # Initialize network
+                    if self.network is None:
+                        return  # init refused its inputs and already said why
                 else:
                     return  # User cancelled
             
@@ -2093,6 +2299,22 @@ class SynapseSimulatorApp(ctk.CTk):
             self.on_mode_change()
             self.btn_stimulate.configure(state="normal")
             
+            # The branch that actually ran can differ from the requested mode
+            # (a fitted signed curve decides by wavelength); say so.
+            n_lit, overrides = summarise_branch_overrides(self.network.synapses, pattern)
+            if overrides:
+                mode_text = f"Mode requested: {mode}\n"
+                notice = ""
+                for o in overrides:
+                    mode_text += (f"Branch that ran: {o['actual']} "
+                                  f"({o['count']} of {n_lit} lit synapses)\n")
+                    notice += (f"  {o['count']} of {n_lit} lit synapses ran {o['actual']} "
+                               f"although {o['requested']} was requested: {o['reason']}\n")
+                self.network_output_text.insert(
+                    "end", f"\n! BRANCH OVERRIDE for '{pattern_name}':\n{notice}")
+            else:
+                mode_text = f"Mode requested: {mode}\nBranch that ran: {mode} (as requested)\n"
+
             tk_messagebox.showinfo(
                 "Pattern Applied",
                 f"Applied '{pattern_name}' pattern\n"
@@ -2100,7 +2322,7 @@ class SynapseSimulatorApp(ctk.CTk):
                 f"Intensity: {intensity:.1f} mW/cm²\n"
                 f"Duration: {duration_ms:.0f} ms\n"
                 f"Pulses: {n_pulses}\n"
-                f"Mode: {mode}"
+                + mode_text
             )
     
     def on_reset(self):
@@ -2122,28 +2344,41 @@ class SynapseSimulatorApp(ctk.CTk):
         self.info_text.insert("end", "\n\nAuto Demo Running...\n")
         self.info_text.insert("end", "=" * 35 + "\n\n")
         
+        # On a FITTED device the signed curve decides the branch by wavelength, so
+        # the potentiation and depression wavelengths must come from the curve;
+        # fixed colours can all sit in the depression band. Without a fitted
+        # curve the requested mode is honoured and the legacy wavelengths apply.
+        if self.synapse.wavelength_curve is not None:
+            pot, dep = pick_branch_wavelengths(self.synapse)
+            demo_wavelengths = ([(pot[0], f"fitted potentiation peak, S={pot[1]:+.2f}")]
+                                if pot else [])
+            dep_wavelength = dep[0] if dep else None
+            if pot is None:
+                self.info_text.insert(
+                    "end", "The fitted spectral response has no potentiating band "
+                    "in range;\npotentiation cannot be demonstrated on this device.\n")
+        else:
+            demo_wavelengths = [(450, "Blue"), (550, "Green"), (650, "Red")]
+            dep_wavelength = 550
+
         # Part 1: Potentiation at different wavelengths
         self.info_text.insert("end", "PART 1: Potentiation\n")
         self.info_text.insert("end", "-" * 35 + "\n")
-        
-        demo_wavelengths = [
-            (450, "Blue"),
-            (550, "Green"),
-            (650, "Red")
-        ]
-        
+
         for wavelength, color_name in demo_wavelengths:
-            self.info_text.insert("end", f"Testing {color_name} ({wavelength} nm)...\n")
+            self.info_text.insert("end", f"Testing {color_name} ({wavelength:.0f} nm)...\n")
             self.wavelength_slider.set(wavelength)
             self.update_wavelength_label(wavelength)
             self.mode_var.set("potentiation")
             
             for i in range(5):
                 self.synapse.apply_stimulus(20, wavelength, 100, 'potentiation')
+                report = self.synapse.last_stimulus_report  # rest() clears it
                 self.synapse.rest(100)
                 self.update_plots()
                 self.update()
             
+            self.info_text.insert("end", f"  Branch: {describe_branch('potentiation', report)}\n")
             self.synapse.rest(300)
             self.update_plots()
             self.update()
@@ -2151,20 +2386,30 @@ class SynapseSimulatorApp(ctk.CTk):
         # Part 2: Depression
         self.info_text.insert("end", "\nPART 2: Depression\n")
         self.info_text.insert("end", "-" * 35 + "\n")
-        self.info_text.insert("end", "Applying depression pulses...\n")
-        
-        self.mode_var.set("depression")
-        self.wavelength_slider.set(550)
-        self.update_wavelength_label(550)
-        
-        for i in range(10):
-            self.synapse.apply_stimulus(20, 550, 100, 'depression')
-            self.synapse.rest(100)
-            self.update_plots()
-            self.update()
+        if dep_wavelength is None:
+            self.info_text.insert(
+                "end", "The fitted spectral response has no depressing band in "
+                "range;\ndepression cannot be demonstrated by light on this device.\n")
+        else:
+            self.info_text.insert("end", f"Applying depression pulses at {dep_wavelength:.0f} nm...\n")
+
+            self.mode_var.set("depression")
+            self.wavelength_slider.set(dep_wavelength)
+            self.update_wavelength_label(dep_wavelength)
+
+            for i in range(10):
+                self.synapse.apply_stimulus(20, dep_wavelength, 100, 'depression')
+                report = self.synapse.last_stimulus_report
+                self.synapse.rest(100)
+                self.update_plots()
+                self.update()
+            self.info_text.insert("end", f"  Branch: {describe_branch('depression', report)}\n")
         
         self.info_text.insert("end", "\nDemo Complete!\n")
+        # update_info() rewrites the whole panel, so keep the demo log and re-append it.
+        demo_log = self.info_text.get("1.0", "end")
         self.update_info()
+        self.info_text.insert("end", "\n" + demo_log)
         self.btn_auto.configure(state="normal", text="Auto Demo")
     
     
@@ -2229,12 +2474,22 @@ class SynapseSimulatorApp(ctk.CTk):
                         # Re-fit with forced number of peaks
                         fitted_model = extract_synapse_model(characterization_suite, wavelength_n_peaks=dialog.result)
                         
-                        # Update stored model
-                        self.loaded_fitted_model = fitted_model
-                        
-                        self.fitting_results_text.insert("end", 
-                            f"✓ Re-fitted with {dialog.result} peak(s).\n\n"
-                        )
+                        # Rebuild the active synapse from the refit, otherwise the
+                        # simulation keeps the old spectral curve.
+                        if self._apply_fitted_model(
+                                fitted_model, characterization_suite,
+                                getattr(self, 'loaded_model_source', 'loaded model')) is None:
+                            fitted_model = self.loaded_fitted_model
+                        else:
+                            # Built from the old model; their weights are now stale.
+                            self.network = None
+                            self.snn = None
+                            self.fitting_results_text.insert("end",
+                                f"✓ Re-fitted with {dialog.result} peak(s). The simulation "
+                                "now uses the refit.\n"
+                                "Existing Network / SNN were built from the previous "
+                                "model: re-initialise them.\n\n"
+                            )
                     else:
                         self.fitting_results_text.insert("end", 
                             "Using automatic peak detection.\n\n"
@@ -2527,6 +2782,7 @@ class SynapseSimulatorApp(ctk.CTk):
             )
             return
         
+        stdp_description = None  # set in spiking mode only
         # Create network based on mode
         if mode == "rate":
             # Rate-based network (existing)
@@ -2537,22 +2793,8 @@ class SynapseSimulatorApp(ctk.CTk):
             from network import SpikingSynapseNetwork
             
             # Get STDP parameters from loaded model or use defaults
-            stdp_params = {}
-            if self.loaded_fitted_model and hasattr(self, 'loaded_fitted_model'):
-                stdp_params = {
-                    'stdp_A_plus': self.loaded_fitted_model.get('stdp_A_plus', 0.5),
-                    'stdp_A_minus': self.loaded_fitted_model.get('stdp_A_minus', 0.3),
-                    'stdp_tau_plus_ms': self.loaded_fitted_model.get('stdp_tau_plus_ms', 20.0),
-                    'stdp_tau_minus_ms': self.loaded_fitted_model.get('stdp_tau_minus_ms', 20.0)
-                }
-            else:
-                stdp_params = {
-                    'stdp_A_plus': 0.5,
-                    'stdp_A_minus': 0.3,
-                    'stdp_tau_plus_ms': 20.0,
-                    'stdp_tau_minus_ms': 20.0
-                }
-            
+            stdp_params, stdp_description = resolve_stdp_parameters(self.loaded_fitted_model)
+
             n_input = rows
             n_hidden = cols
             # The GUI's variability control applies here too — the spiking
@@ -2597,8 +2839,10 @@ class SynapseSimulatorApp(ctk.CTk):
         self.network_output_text.insert("end", f"  Std G:  {stats['std_G']*1e6:.2f} µS\n")
         self.network_output_text.insert("end", f"  Min G:  {stats['min_G']*1e6:.2f} µS\n")
         self.network_output_text.insert("end", f"  Max G:  {stats['max_G']*1e6:.2f} µS\n\n")
+        if stdp_description is not None:
+            self.network_output_text.insert("end", stdp_description + "\n")
         self.network_output_text.insert("end", "Ready to apply patterns!\n")
-        
+
         # Update tab title to show current size
         # (Note: This requires recreating the tab - optional enhancement)
         
@@ -2665,6 +2909,10 @@ class SynapseSimulatorApp(ctk.CTk):
         self.network_output_text.insert("end", "Step 1: Initializing network...\n")
         self.on_network_init()
         self.update()
+        if self.network is None:
+            # on_network_init refused the size/variability entries and said why.
+            self.btn_network.configure(state="normal", text="Run Network Demo")
+            return
         
         # Demo sequence
         demo_patterns = [
@@ -2674,8 +2922,28 @@ class SynapseSimulatorApp(ctk.CTk):
             ('Cross', 5),
         ]
         
+        # The demo is a LIGHT potentiation demo, so it needs a wavelength the
+        # device actually potentiates at. A fitted signed curve can put 550 nm
+        # in the depression band.
+        if self.synapse.wavelength_curve is not None:
+            pot, _ = pick_branch_wavelengths(self.synapse)
+            if pot is None:
+                self.network_output_text.insert(
+                    "end", "\nThe fitted spectral response has no potentiating band "
+                    "in range, so the light potentiation demo cannot be run on "
+                    "this device.\n")
+                self.btn_network.configure(state="normal", text="Run Network Demo")
+                return
+            demo_wavelength = pot[0]
+            wavelength_note = f" (fitted potentiation peak, S={pot[1]:+.2f})"
+        else:
+            demo_wavelength = 550
+            wavelength_note = " (no fitted curve: default)"
+        self.network_output_text.insert(
+            "end", f"\nLight wavelength: {demo_wavelength:.0f} nm{wavelength_note}\n")
+
         self.network_output_text.insert("end", "\nStep 2: Applying pattern sequence...\n")
-        
+
         for pattern_name, n_pulses in demo_patterns:
             self.pattern_var.set(pattern_name)
             self.n_pulses_slider.set(n_pulses)
@@ -2696,13 +2964,16 @@ class SynapseSimulatorApp(ctk.CTk):
                 pattern = SpatialPatterns.uniform(network_shape)
             for i in range(n_pulses):
                 self.network.apply_spatial_pattern(
-                    pattern, 20, 550, 100, 'potentiation', pattern_name
+                    pattern, intensity_mW_cm2=20, wavelength_nm=demo_wavelength,
+                    duration_ms=100, mode='potentiation', stimulus_type='light',
+                    pattern_name=pattern_name
                 )
                 self.network.rest(100)
             
             self.network_output_text.insert("end", f"  ✓ Complete\n")
             self.update()
         
+        self.update_network_plot()
         self.network_output_text.insert("end", "\nStep 3: Showing evolution...\n")
         self.on_network_show_evolution()
         
@@ -2778,7 +3049,7 @@ class SynapseSimulatorApp(ctk.CTk):
         
         # Add compact statistics footer
         footer_text = (f'Time: {self.network.current_time:.1f}s | '
-                      f'Total: {stats["total_weight"]*1e6:.1f}µS | '
+                      f'Total: {np.sum(self.network.G_matrix)*1e6:.1f}µS | '
                       f'Std: {stats["std_G"]*1e6:.2f}µS | '
                       f'States: {len(self.network.history["G_matrices"])}')
         
@@ -2961,10 +3232,9 @@ Total pulses applied: {n_pulses}
         self.snn_output_text.insert("end", "Starting SNN simulation...\n")
         
         try:
-            n_input = int(self.snn_n_input.get())
-            n_hidden = int(self.snn_n_hidden.get())
-            rate_hz = float(self.snn_rate.get())
-            duration_ms = float(self.snn_duration.get())
+            n_input, n_hidden, rate_hz, duration_ms = parse_snn_run_inputs(
+                self.snn_n_input.get(), self.snn_n_hidden.get(),
+                self.snn_rate.get(), self.snn_duration.get())
             learning_enabled = self.snn_learning_var.get()
 
             # Device variability, validated the same way the Network tab does.
@@ -3009,47 +3279,9 @@ Total pulses applied: {n_pulses}
             # fitted 0.4517 means 0.4517% and must be passed through UNCHANGED.
             # This site used to divide by 100, making every weight update 100x
             # too small while the simulation still reported success.
-            if (self.loaded_fitted_model
-                    and self.loaded_experimental_data
-                    and 'stdp' in self.loaded_experimental_data):
-                stdp_data = self.loaded_experimental_data['stdp']
-                from fitting import fit_stdp_window
-                fitted_stdp = fit_stdp_window(stdp_data)
+            stdp_params, stdp_description = resolve_stdp_parameters(self.loaded_fitted_model)
+            self.snn_output_text.insert("end", stdp_description)
 
-                stdp_params = {
-                    'stdp_A_plus': fitted_stdp['A_plus'],
-                    'stdp_A_minus': fitted_stdp['A_minus'],
-                    'stdp_tau_plus_ms': fitted_stdp['tau_plus_ms'],
-                    'stdp_tau_minus_ms': fitted_stdp['tau_minus_ms']
-                }
-                self.snn_output_text.insert(
-                    "end",
-                    "Using fitted STDP parameters "
-                    f"(A+={fitted_stdp['A_plus']:.3f}%, "
-                    f"A-={fitted_stdp['A_minus']:.3f}% of dynamic range, "
-                    f"tau+={fitted_stdp['tau_plus_ms']:.1f} ms, "
-                    f"tau-={fitted_stdp['tau_minus_ms']:.1f} ms)\n"
-                )
-            else:
-                # The documented defaults from CLAUDE.md. This used to be
-                # 0.15/0.09 - undocumented values 3.3x weaker than spec,
-                # labelled to the user as "default".
-                stdp_params = {
-                    'stdp_A_plus': 0.5,
-                    'stdp_A_minus': 0.3,
-                    'stdp_tau_plus_ms': 20.0,
-                    'stdp_tau_minus_ms': 20.0
-                }
-                reason = ("no fitted model is loaded"
-                          if not self.loaded_fitted_model else
-                          "the loaded model carries no STDP measurement")
-                self.snn_output_text.insert(
-                    "end",
-                    f"Using DEFAULT STDP parameters ({reason}): "
-                    "A+=0.5%, A-=0.3% of dynamic range, tau=20 ms.\n"
-                    "These are library defaults, NOT measured from your device.\n"
-                )
-            
             base_params = {
                 'G_min': self.synapse.G_min,
                 'G_max': self.synapse.G_max,
@@ -3159,7 +3391,8 @@ Total pulses applied: {n_pulses}
         
         # Initial weights
         ax3 = self.snn_fig.add_subplot(gs[2, 0])
-        W0 = self.snn_results['weight_history'][0] * 1e6
+        # weight_history is already in µS (get_weight_matrix converts).
+        W0 = self.snn_results['weight_history'][0]
         im1 = ax3.imshow(W0, cmap='RdBu_r', aspect='auto')
         ax3.set_title('Initial Weights (µS)')
         ax3.set_xlabel('Hidden')
@@ -3168,7 +3401,7 @@ Total pulses applied: {n_pulses}
         
         # Final weights
         ax4 = self.snn_fig.add_subplot(gs[2, 1])
-        Wf = self.snn_results['weight_history'][-1] * 1e6
+        Wf = self.snn_results['weight_history'][-1]
         im2 = ax4.imshow(Wf, cmap='RdBu_r', aspect='auto')
         ax4.set_title('Final Weights (µS)')
         ax4.set_xlabel('Hidden')

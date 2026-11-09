@@ -196,6 +196,62 @@ class DataParser:
         
         return parsed
     
+    # Experiments whose points are independent measurements (each its own
+    # time, delay or frequency). A missing reading is simply absent there.
+    _INDEPENDENT_POINT_EXPERIMENTS = ('retention', 'stdp', 'srdp')
+
+    @staticmethod
+    def _sanitise_datasets(datasets: List[Dict]):
+        """Make missing readings explicit before any estimator sees them.
+
+        The hardware path writes NaN conductance where it cannot measure one
+        (zero read bias, CLAUDE.md), and a hand-edited file may carry null.
+        Left in, NaN poisoned every estimator silently: np.sort put it at the
+        top of the plateau decile, comparisons with it were all False, and a
+        suite with 5% missing readings came back with G_max = 1.66 µS against a
+        true 99 µS, reported as successfully extracted.
+
+        Pulse-train traces keep their length with NaN in place, because the
+        index IS the pulse number: deleting a reading would merge two pulses
+        into one increment. Independent-point experiments drop the pair. A
+        dataset with no finite reading at all is excluded. Every case is
+        returned as a warning for the extraction report.
+
+        Returns (datasets, warnings). Input dicts are not modified.
+        """
+        cleaned, warnings = [], []
+        for ds in datasets:
+            name = ds.get('filename', '<unnamed dataset>')
+            exp_type = str(ds.get('metadata', {}).get('experiment_type', '')).lower()
+            x = np.array([np.nan if v is None else v for v in ds.get('x_data', [])], dtype=float)
+            y = np.array([np.nan if v is None else v for v in ds.get('y_data', [])], dtype=float)
+            if x.shape != y.shape:
+                raise ValueError(f"{name}: x_data has {x.size} points but y_data has {y.size}")
+            bad = ~(np.isfinite(x) & np.isfinite(y))
+            n_bad = int(bad.sum())
+            if n_bad == 0:
+                cleaned.append(ds)
+                continue
+            if n_bad == y.size:
+                warnings.append(f"{name}: no finite reading in {y.size} points; "
+                                "dataset excluded from every fit")
+                continue
+            out = dict(ds)
+            if exp_type in DataParser._INDEPENDENT_POINT_EXPERIMENTS:
+                out['x_data'] = x[~bad].tolist()
+                out['y_data'] = y[~bad].tolist()
+                warnings.append(f"{name}: {n_bad} of {y.size} readings non-finite; "
+                                "those points were dropped")
+            else:
+                y[bad] = np.nan
+                out['x_data'] = x.tolist()
+                out['y_data'] = y.tolist()
+                warnings.append(f"{name}: {n_bad} of {y.size} readings non-finite; "
+                                "kept as gaps so pulse numbering is preserved, "
+                                "and excluded from every estimate")
+            cleaned.append(out)
+        return cleaned, warnings
+
     @staticmethod
     def _parse_v2(suite: Dict) -> Dict:
         """Parse v2.0 format (data_converter.py output)."""
@@ -208,8 +264,9 @@ class DataParser:
             'srdp_data': []
         }
         
-        datasets = suite.get('datasets', [])
-        
+        datasets, parsed['data_warnings'] = DataParser._sanitise_datasets(
+            suite.get('datasets', []))
+
         for ds in datasets:
             exp_type = ds['metadata'].get('experiment_type', '').lower()
             
@@ -334,6 +391,9 @@ class DataParser:
 
         for ds in datasets:
             y_data = np.asarray(ds.get('y_data', []), dtype=float)
+            # Gaps are missing readings (see _sanitise_datasets); the plateau
+            # and the trace direction are read from what was measured.
+            y_data = y_data[np.isfinite(y_data)]
             metrics = ds.get('derived_metrics', {})
 
             if y_data.size >= 10:
@@ -438,23 +498,32 @@ class DataParser:
         not yet begun to saturate.
         """
         y = np.asarray(y_data, dtype=float)
-        if len(y) < 3:
+        finite = np.flatnonzero(np.isfinite(y))
+        if len(finite) < 3:
             return 0.0
 
-        g0 = y[0]
-        total_excursion = y[-1] - g0
+        # Gaps are missing readings; the index stays the pulse number.
+        g0 = y[finite[0]]
+        total_excursion = y[finite[-1]] - g0
         if not np.isfinite(total_excursion) or total_excursion == 0:
             return 0.0
 
         # Leading window: points still within 20% of the full excursion.
-        within = np.flatnonzero(np.abs(y - g0) <= abs(total_excursion) * 0.2)
+        within = finite[np.abs(y[finite] - g0) <= abs(total_excursion) * 0.2]
         n_window = int(within[-1]) + 1 if len(within) else 3
         # At least 3 points to fit a slope through noise; at most 15, beyond
         # which even the linear portion starts to bend.
         n_window = int(np.clip(n_window, 3, min(15, len(y))))
 
         pulses = np.arange(n_window, dtype=float)
-        slope = float(np.polyfit(pulses, y[:n_window], 1)[0])
+        ok = np.isfinite(y[:n_window])
+        if ok.sum() < 3:
+            # Too many gaps in the leading window: widen to the first three
+            # finite readings rather than fit a line through fewer.
+            n_window = int(finite[2]) + 1
+            pulses = np.arange(n_window, dtype=float)
+            ok = np.isfinite(y[:n_window])
+        slope = float(np.polyfit(pulses[ok], y[:n_window][ok], 1)[0])
         return slope
 
     @staticmethod
@@ -484,6 +553,10 @@ class DataParser:
             y_data = ds.get('y_data', [])
 
             rate = DataParser._initial_rate(y_data)
+            raw_rate = rate
+            y_arr = np.asarray(y_data, dtype=float)
+            finite_y = y_arr[np.isfinite(y_arr)]
+            g_start = float(finite_y[0]) if finite_y.size else float('nan')
 
             # Divide out the drive, so what remains is a RESPONSIVITY — rate
             # per unit intensity per unit pulse width — rather than a raw rate.
@@ -506,18 +579,17 @@ class DataParser:
 
             raw_responses[wl] = {
                 'rate': rate,
+                'raw_rate': raw_rate,
+                'g_start': g_start,
                 'drive': drive,
+                'timing': {k: md.get(k) for k in
+                           ('pulse_period_ms', 'frequency_Hz', 'pulse_width_ms')},
                 'metrics': metrics,
                 'dataset': ds
             }
 
         rates = np.array([raw_responses[wl]['rate'] for wl in wavelengths], dtype=float)
-
-        # Per-branch normalisation constants.
-        positive = rates[rates > 0]
-        negative = rates[rates < 0]
-        max_positive = float(np.max(positive)) if positive.size else 0.0
-        max_negative = float(np.abs(np.min(negative))) if negative.size else 0.0
+        normalised, max_positive, max_negative = _normalise_per_branch(rates)
 
         response = {
             'wavelengths_nm': wavelengths,
@@ -536,20 +608,24 @@ class DataParser:
             'measurement_type': 'wavelength_sweep'
         }
 
-        for wl in wavelengths:
+        # Inputs for _subtract_relaxation_from_wavelength_response, which runs
+        # once decay_tau and G_min are known.
+        response['raw_initial_rate_S_per_pulse'] = []
+        response['g_start_S'] = []
+        response['drive'] = []
+        response['timing'] = []
+
+        for wl, normalized in zip(wavelengths, normalised):
             data = raw_responses[wl]
             rate = data['rate']
             metrics = data['metrics']
 
-            if rate > 0:
-                normalized = rate / max_positive if max_positive > 0 else 0.0
-            elif rate < 0:
-                normalized = rate / max_negative if max_negative > 0 else 0.0
-            else:
-                normalized = 0.0
-
+            response['raw_initial_rate_S_per_pulse'].append(data['raw_rate'])
+            response['g_start_S'].append(data['g_start'])
+            response['drive'].append(data['drive'])
+            response['timing'].append(data['timing'])
             response['initial_rate_S_per_pulse'].append(rate)
-            response['delta_g_normalized'].append(normalized)
+            response['delta_g_normalized'].append(float(normalized))
             response['delta_g_S'].append(metrics.get('delta_G', 0))
             response['delta_g_percent'].append(metrics.get('percent_change', 0))
             response['g_initial_S'].append(metrics.get('G_initial', 0))
@@ -571,6 +647,10 @@ class DataParser:
         if len(y) < 4:
             return 0.0
         d = y[:-2] - 2 * y[1:-1] + y[2:]
+        # Any triplet touching a missing reading carries no information.
+        d = d[np.isfinite(d)]
+        if d.size == 0:
+            return 0.0
         mad = float(np.median(np.abs(d - np.median(d))))
         # 1.4826 converts MAD to a standard deviation for Gaussian noise.
         return mad * 1.4826 / np.sqrt(6.0)
@@ -612,7 +692,7 @@ class DataParser:
         # sits and says nothing about its measured increment. Nothing is
         # discarded for having an inconveniently small or negative delta.
         sigma = DataParser._estimate_noise_sigma(y_data)
-        G_ceiling = float(np.max(y_data))
+        G_ceiling = float(np.nanmax(y_data))
         # Three sigma of headroom, so (G_max_est − G_init) is meaningfully
         # positive rather than dominated by noise.
         min_headroom = 3.0 * sigma
@@ -621,6 +701,9 @@ class DataParser:
             G_init = y_data[i]
             G_final = y_data[i + sample_interval]
 
+            # An increment needs both ends measured; the spacing stays exact.
+            if not (np.isfinite(G_init) and np.isfinite(G_final)):
+                continue
             if (G_ceiling - G_init) <= min_headroom:
                 continue
 
@@ -671,13 +754,15 @@ class DataParser:
         # ABOVE the floor the trace reached, since the depression rate goes as
         # (G − G_min)^beta.
         sigma = DataParser._estimate_noise_sigma(y_data)
-        G_floor = float(np.min(y_data))
+        G_floor = float(np.nanmin(y_data))
         min_headroom = 3.0 * sigma
 
         for i in range(0, len(y_data) - sample_interval, sample_interval):
             G_init = y_data[i]
             G_final = y_data[i + sample_interval]
 
+            if not (np.isfinite(G_init) and np.isfinite(G_final)):
+                continue
             if (G_init - G_floor) <= min_headroom:
                 continue
 
@@ -1228,6 +1313,64 @@ def _relaxation_factor(data, decay_tau):
     return float(n_pulses) * (float(period_ms) / 1000.0) / float(decay_tau)
 
 
+def _normalise_per_branch(rates):
+    """Strongest potentiation → +1, strongest depression → −1, independently.
+
+    Returns (normalised, max_positive, max_negative).
+    """
+    rates = np.asarray(rates, dtype=float)
+    positive = rates[rates > 0]
+    negative = rates[rates < 0]
+    max_positive = float(np.max(positive)) if positive.size else 0.0
+    max_negative = float(np.abs(np.min(negative))) if negative.size else 0.0
+    normalised = np.zeros_like(rates)
+    if max_positive > 0:
+        normalised[rates > 0] = rates[rates > 0] / max_positive
+    if max_negative > 0:
+        normalised[rates < 0] = rates[rates < 0] / max_negative
+    return normalised, max_positive, max_negative
+
+
+def _subtract_relaxation_from_wavelength_response(response, G_min, decay_tau):
+    """Remove spontaneous relaxation from the measured spectral initial rates.
+
+    The measured rate at pulse 0 is drive MINUS relaxation,
+        dG/dn|0 = A·S(λ)·I·(G_max − G0)^α·dt − (G0 − G_min)·t_pulse/τ,
+    and the device model adds relaxation back as its own term (CLAUDE.md), so a
+    responsivity left uncorrected counts it twice. On the synthetic suite the
+    uncorrected curve read −0.10 to −0.16 at 650–750 nm, where the device has
+    no depression band at all: that was the dark drift of a trace starting at
+    0.9 G_max, normalised as if it were optical response.
+
+    Uses the same elapsed-time basis as the nonlinearity fits
+    (_relaxation_factor). Returns a new response dict; the input is unchanged.
+    """
+    out = dict(response)
+    raw = response.get('raw_initial_rate_S_per_pulse')
+    if not raw or not decay_tau or decay_tau <= 0:
+        out['relaxation_subtracted'] = None
+        return out
+
+    corrected, bases = [], set()
+    for r, g0, drive, timing in zip(raw, response['g_start_S'],
+                                    response['drive'], response['timing']):
+        per_pulse = _relaxation_factor(dict(timing, sample_interval_pulses=1), decay_tau)
+        bases.add(_relaxation_basis(timing))
+        drive_rate = r + (g0 - G_min) * per_pulse
+        corrected.append(drive_rate / drive if drive > 0 else drive_rate)
+
+    normalised, max_positive, max_negative = _normalise_per_branch(corrected)
+    out['initial_rate_S_per_pulse'] = [float(v) for v in corrected]
+    out['delta_g_normalized'] = [float(v) for v in normalised]
+    out['max_positive_rate'] = max_positive
+    out['max_negative_rate'] = max_negative
+    out['max_abs_response'] = max(max_positive, max_negative)
+    out['relaxation_subtracted'] = {'decay_tau_s': float(decay_tau),
+                                    'G_min_S': float(G_min),
+                                    'timing_basis': sorted(bases)}
+    return out
+
+
 def _relaxation_basis(data):
     """Which timing quantity `_relaxation_factor` used, for the report."""
     if data.get('pulse_period_ms'):
@@ -1576,12 +1719,19 @@ def _fit_rate_constant(y_data, spectral_weight, intensity, dt_s,
 
     y_data = np.asarray(y_data, dtype=float)
     n_fit = min(len(y_data), 30)
+    # Integrate from the first measured pulse; gaps (missing readings) are
+    # integrated through but contribute no residual.
+    finite = np.flatnonzero(np.isfinite(y_data[:n_fit]))
+    if len(finite) < 3:
+        return None, {'reason': f'only {len(finite)} finite readings in the first '
+                                f'{n_fit} pulses', 'converged': False}
+    start = int(finite[0])
 
     def sse(log10_rate):
         rate = 10.0 ** log10_rate
-        G = y_data[0]
+        G = y_data[start]
         error = 0.0
-        for i in range(1, n_fit):
+        for i in range(start + 1, n_fit):
             drive = rate * spectral_weight * intensity
             if depressing:
                 dG = -drive * max(G - G_min, 0.0) ** exponent * dt_s
@@ -1596,7 +1746,8 @@ def _fit_rate_constant(y_data, spectral_weight, intensity, dt_s,
             if decay_tau and decay_tau > 0:
                 dG -= (G - G_min) / decay_tau * dt_s
             G = np.clip(G + dG, G_min, G_max)
-            error += (G - y_data[i]) ** 2
+            if np.isfinite(y_data[i]):
+                error += (G - y_data[i]) ** 2
         return error
 
     result = minimize_scalar(sse, bounds=_RATE_LOG_BOUNDS, method='bounded',
@@ -1764,6 +1915,23 @@ def extract_rate_constants(parsed_data, fitted_model):
     }
 
 
+def stdp_window_percent(dt_ms, A_plus, A_minus, tau_plus_ms, tau_minus_ms):
+    """The STDP window in percent of dynamic range, shared by fit and plot.
+
+    Δt == 0 is a simultaneous pre/post pair. The spec defines the window by
+    its two one-sided limits, which disagree at the origin, so the value there
+    is genuinely undefined (NaN) rather than A_plus - A_minus, a discontinuity
+    that appears nowhere in the spec. Output is float regardless of the input
+    dtype: a whole-millisecond sweep is an integer array and would otherwise
+    truncate the LTP branch to zeros (M3).
+    """
+    dt = np.asarray(dt_ms, dtype=float)
+    result = np.full(dt.shape, np.nan, dtype=float)
+    result[dt > 0] = A_plus * np.exp(-dt[dt > 0] / tau_plus_ms)
+    result[dt < 0] = -A_minus * np.exp(dt[dt < 0] / tau_minus_ms)
+    return result
+
+
 def fit_stdp_window(stdp_data):
     """
     Fit STDP window parameters from spike timing-dependent plasticity data.
@@ -1886,21 +2054,7 @@ def fit_stdp_window(stdp_data):
     )
 
     # Calculate R² for full STDP curve
-    def stdp_model(dt):
-        dt = np.asarray(dt, dtype=float)
-        # dtype=float explicitly, not zeros_like's inherited dtype — see the
-        # note on delta_t above (M3).
-        result = np.zeros(dt.shape, dtype=float)
-        result[dt > 0] = A_plus * np.exp(-dt[dt > 0] / tau_plus)
-        result[dt < 0] = -A_minus * np.exp(dt[dt < 0] / tau_minus)
-        # Δt == 0 is a simultaneous pre/post pair. The spec defines the window
-        # by its two one-sided limits, which disagree at the origin, so the
-        # value there is genuinely undefined rather than A_plus - A_minus (a
-        # discontinuity that appears nowhere in the spec). Left at 0, and
-        # excluded from R² below.
-        return result
-
-    predicted = stdp_model(delta_t)
+    predicted = stdp_window_percent(delta_t, A_plus, A_minus, tau_plus, tau_minus)
     scored = delta_t != 0
     r2 = _r_squared(delta_g_percent[scored], predicted[scored])
 
@@ -1915,6 +2069,18 @@ def fit_stdp_window(stdp_data):
         'fit_quality_R2': r2,
         'amplitude_units': 'percent_of_dynamic_range',
     }
+
+
+def srdp_sigmoid_percent(freq_hz, baseline, max_change, transition_freq_hz,
+                         slope_decades):
+    """The fitted SRDP curve, in percent of dynamic range, from frequency in Hz.
+
+    One definition shared by the fit and by every plot that draws it, so a
+    drawn curve cannot diverge from the model whose R² is in the legend.
+    """
+    log_f = np.log10(np.asarray(freq_hz, dtype=float))
+    return baseline + max_change / (
+        1 + np.exp(-(log_f - np.log10(transition_freq_hz)) / slope_decades))
 
 
 def fit_srdp_curve(srdp_data):
@@ -1961,9 +2127,6 @@ def fit_srdp_curve(srdp_data):
     # remains a frequency in Hz for the caller.
     log_f = np.log10(frequencies)
 
-    def sigmoid_log(lf, max_change, log_f0, slope_decades):
-        return max_change / (1 + np.exp(-(lf - log_f0) / slope_decades))
-
     # M8: the baseline used to be y_data[0] — the LOWEST-frequency point,
     # which on a typical sweep already carries ~27% of the full sigmoid. Using
     # it as "zero response" subtracts a real part of the signal and biases f0
@@ -1971,7 +2134,8 @@ def fit_srdp_curve(srdp_data):
     # asymptote is fitted instead, as a free parameter, so no point has to be
     # assumed responseless.
     def sigmoid_log_offset(lf, baseline, max_change, log_f0, slope_decades):
-        return baseline + sigmoid_log(lf, max_change, log_f0, slope_decades)
+        return srdp_sigmoid_percent(10.0 ** lf, baseline, max_change,
+                                    10.0 ** log_f0, slope_decades)
 
     span = float(np.max(delta_g_percent) - np.min(delta_g_percent))
     p0 = [
@@ -2210,6 +2374,9 @@ def extract_synapse_model(characterization_suite: Dict, verbose: bool = True, wa
         'warnings': []
     }
     
+    # Missing readings found while parsing (see DataParser._sanitise_datasets).
+    extraction_report['warnings'].extend(parsed_data.get('data_warnings', []))
+
     # 1. Dynamic range (CRITICAL - required)
     if 'dynamic_range' in parsed_data and parsed_data['dynamic_range'] is not None:
         dr_data = parsed_data['dynamic_range']
@@ -2221,6 +2388,12 @@ def extract_synapse_model(characterization_suite: Dict, verbose: bool = True, wa
         else:
             fitted_model['on_off_ratio'] = None
         extraction_report['extracted'].append('dynamic_range')
+        # A plausibility flag, not a correction: a conductance above 1 S is
+        # almost always µS or mS data declared as siemens.
+        if fitted_model['G_max'] > 1.0 or fitted_model['G_min'] <= 0:
+            extraction_report['warnings'].append(
+                f"implausible conductance window G_min = {fitted_model['G_min']:.3g} S, "
+                f"G_max = {fitted_model['G_max']:.3g} S; check y_units in the metadata")
     else:
         extraction_report['failed'].append('dynamic_range')
         extraction_report['warnings'].append("CRITICAL: No dynamic range data - using default G_min/G_max")
@@ -2230,9 +2403,48 @@ def extract_synapse_model(characterization_suite: Dict, verbose: bool = True, wa
         extraction_report['defaults_used'].append('G_min')
         extraction_report['defaults_used'].append('G_max')
     
-    # 2. Wavelength sensitivity (optional)
+    # 2. Retention/decay.
+    #
+    # Fitted BEFORE the nonlinearity exponents, which need decay_tau: spontaneous
+    # relaxation runs during stimulation, so each sampled increment is drive
+    # minus relaxation, and an exponent fitted without subtracting it absorbs it
+    # (measured: alpha 0.86 against a true 0.75, which then pushed A_peak to
+    # nearly 3x). Retention is independent of both exponents, so nothing is lost
+    # by fitting it first.
+    if 'retention' in parsed_data and parsed_data['retention'] is not None:
+        try:
+            ret_fit = fit_retention_decay(parsed_data['retention'])
+            fitted_model['decay_tau'] = ret_fit['decay_tau_s']
+            fitted_model['retention_fit_R2'] = ret_fit['fit_quality_R2']
+            fitted_model['retention_curve'] = ret_fit['fitted_curve']
+            extraction_report['extracted'].append('retention')
+            # Any unit conversion applied on the way in is reported, so a
+            # decay_tau derived from a millisecond axis is visibly derived
+            # from a millisecond axis (M11).
+            for note in parsed_data['retention'].get('unit_conversions', []):
+                extraction_report['warnings'].append(f"retention: {note}")
+        except Exception as e:
+            extraction_report['failed'].append('retention')
+            extraction_report['warnings'].append(f"Retention fitting failed: {e}")
+            fitted_model['decay_tau'] = 100.0
+            extraction_report['defaults_used'].append('decay_tau')
+    else:
+        extraction_report['warnings'].append("No retention data - using default decay_tau")
+        fitted_model['decay_tau'] = 100.0
+        extraction_report['defaults_used'].append('decay_tau')
+
+    # 3. Wavelength sensitivity (optional). After retention: the measured
+    # spectral rates contain relaxation, which is subtracted using decay_tau.
     if 'wavelength_response' in parsed_data and parsed_data['wavelength_response'] is not None:
         try:
+            # Relaxation is subtracted with the decay_tau the model will run
+            # with, so the simulated device reproduces the measured rates.
+            parsed_data['wavelength_response'] = _subtract_relaxation_from_wavelength_response(
+                parsed_data['wavelength_response'], fitted_model['G_min'], fitted_model['decay_tau'])
+            if 'decay_tau' in extraction_report['defaults_used']:
+                extraction_report['warnings'].append(
+                    'wavelength response: relaxation subtracted with the DEFAULT decay_tau '
+                    f"({fitted_model['decay_tau']} s), which was not measured")
             wl_fit = fit_wavelength_sensitivity(parsed_data['wavelength_response'], force_n_peaks=wavelength_n_peaks)
             fitted_model['lambda_peak'] = wl_fit['lambda_peak_nm']
             fitted_model['lambda_width'] = wl_fit['lambda_width_nm']
@@ -2264,36 +2476,6 @@ def extract_synapse_model(characterization_suite: Dict, verbose: bool = True, wa
         extraction_report['defaults_used'].append('lambda_peak')
         extraction_report['defaults_used'].append('lambda_width')
     
-    # 3. Retention/decay.
-    #
-    # Fitted BEFORE the nonlinearity exponents, which need decay_tau: spontaneous
-    # relaxation runs during stimulation, so each sampled increment is drive
-    # minus relaxation, and an exponent fitted without subtracting it absorbs it
-    # (measured: alpha 0.86 against a true 0.75, which then pushed A_peak to
-    # nearly 3x). Retention is independent of both exponents, so nothing is lost
-    # by fitting it first.
-    if 'retention' in parsed_data and parsed_data['retention'] is not None:
-        try:
-            ret_fit = fit_retention_decay(parsed_data['retention'])
-            fitted_model['decay_tau'] = ret_fit['decay_tau_s']
-            fitted_model['retention_fit_R2'] = ret_fit['fit_quality_R2']
-            fitted_model['retention_curve'] = ret_fit['fitted_curve']
-            extraction_report['extracted'].append('retention')
-            # Any unit conversion applied on the way in is reported, so a
-            # decay_tau derived from a millisecond axis is visibly derived
-            # from a millisecond axis (M11).
-            for note in parsed_data['retention'].get('unit_conversions', []):
-                extraction_report['warnings'].append(f"retention: {note}")
-        except Exception as e:
-            extraction_report['failed'].append('retention')
-            extraction_report['warnings'].append(f"Retention fitting failed: {e}")
-            fitted_model['decay_tau'] = 100.0
-            extraction_report['defaults_used'].append('decay_tau')
-    else:
-        extraction_report['warnings'].append("No retention data - using default decay_tau")
-        fitted_model['decay_tau'] = 100.0
-        extraction_report['defaults_used'].append('decay_tau')
-
     # 4. Nonlinearity exponent (optional)
     if 'nonlinearity' in parsed_data and parsed_data['nonlinearity'] is not None:
         try:
@@ -2380,6 +2562,7 @@ def extract_synapse_model(characterization_suite: Dict, verbose: bool = True, wa
             fitted_model['srdp_transition_freq_hz'] = srdp_fit['transition_freq_hz']
             fitted_model['srdp_slope'] = srdp_fit['slope']
             fitted_model['srdp_max_change'] = srdp_fit['max_change']
+            fitted_model['srdp_baseline'] = srdp_fit['baseline']
             fitted_model['srdp_fit_R2'] = srdp_fit['fit_quality_R2']
             extraction_report['extracted'].append('srdp')
         except Exception as e:
@@ -2390,6 +2573,7 @@ def extract_synapse_model(characterization_suite: Dict, verbose: bool = True, wa
             fitted_model['srdp_transition_freq_hz'] = 10.0
             fitted_model['srdp_slope'] = 0.3
             fitted_model['srdp_max_change'] = 20.0
+            fitted_model['srdp_baseline'] = 0.0
             extraction_report['defaults_used'].append('srdp_params')
     else:
         extraction_report['warnings'].append("No SRDP data - using default SRDP parameters")
@@ -2401,6 +2585,7 @@ def extract_synapse_model(characterization_suite: Dict, verbose: bool = True, wa
         # of 0.2 was a fraction against a fitted value in percent — the same
         # field carrying two units 140x apart depending on which path ran (M7).
         fitted_model['srdp_max_change'] = 20.0
+        fitted_model['srdp_baseline'] = 0.0
         extraction_report['defaults_used'].append('srdp_params')
     
     # 7. Extract A_peak and B_peak from experimental data
@@ -2619,9 +2804,13 @@ def plot_fitting_results(characterization_suite: Dict, fitted_model: Dict, true_
         ax = plt.subplot(n_rows, n_cols, plot_idx)
         plot_idx += 1
         
-        wl_data = parsed_data['wavelength_response']
+        # The points the curve was fitted to: relaxation removed with the
+        # model's own G_min and decay_tau, exactly as extract_synapse_model did.
+        wl_data = _subtract_relaxation_from_wavelength_response(
+            parsed_data['wavelength_response'],
+            fitted_model.get('G_min'), fitted_model.get('decay_tau'))
         wavelengths = np.array(wl_data['wavelengths_nm'])
-        
+
         # Use normalized delta_g if available
         if 'delta_g_normalized' in wl_data:
             delta_g_values = np.array(wl_data['delta_g_normalized'])
@@ -2738,14 +2927,8 @@ def plot_fitting_results(characterization_suite: Dict, fitted_model: Dict, true_
             tau_plus = fitted_model['stdp_tau_plus_ms']
             tau_minus = fitted_model['stdp_tau_minus_ms']
             
-            # Approximate scaling to match data (delta_g_percent scale)
-            G_range = (fitted_model['G_max'] - fitted_model['G_min'])
-            scale = 10.0  # Approximate scale factor
-            
-            stdp_fit = np.zeros_like(t_fit)
-            stdp_fit[t_fit > 0] = A_plus * np.exp(-t_fit[t_fit > 0] / tau_plus) * scale
-            stdp_fit[t_fit < 0] = -A_minus * np.exp(t_fit[t_fit < 0] / tau_minus) * scale
-            stdp_fit[t_fit == 0] = (A_plus - A_minus) * scale
+            # Same units as the data (percent of dynamic range): no scaling.
+            stdp_fit = stdp_window_percent(t_fit, A_plus, A_minus, tau_plus, tau_minus)
             
             ax.plot(t_fit, stdp_fit, '-', color='darkviolet',
                    label=f"Fit: A+={A_plus:.2f}, τ+={tau_plus:.1f}ms (R²={fitted_model.get('stdp_fit_R2', 0):.3f})")
@@ -2770,15 +2953,16 @@ def plot_fitting_results(characterization_suite: Dict, fitted_model: Dict, true_
         ax.semilogx(frequencies, delta_g_percent, 'o', markersize=6, label='Data', color='darkorange')
         
         # Plot fitted SRDP curve if parameters available
-        if all(k in fitted_model for k in ['srdp_transition_freq_hz', 'srdp_slope', 'srdp_max_change']):
+        if all(k in fitted_model for k in ['srdp_transition_freq_hz', 'srdp_slope', 'srdp_max_change', 'srdp_baseline']):
             f_fit = np.logspace(np.log10(frequencies.min()), np.log10(frequencies.max()), 100)
             
             # Reconstruct sigmoid curve
             f0 = fitted_model['srdp_transition_freq_hz']
             slope = fitted_model['srdp_slope']
             max_change = fitted_model['srdp_max_change']
+            baseline = fitted_model['srdp_baseline']
             
-            srdp_fit = max_change / (1 + np.exp(-(f_fit - f0) / slope))
+            srdp_fit = srdp_sigmoid_percent(f_fit, baseline, max_change, f0, slope)
             
             ax.semilogx(f_fit, srdp_fit, '-', color='orangered',
                        label=f"Fit: f0={f0:.1f}Hz (R²={fitted_model.get('srdp_fit_R2', 0):.3f})")

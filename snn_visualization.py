@@ -579,12 +579,12 @@ def plot_srdp_curve(srdp_data, fitted_params=None, ax=None):
         # Slope is in DECADES of frequency (fitting.py fits the sigmoid in
         # log10 f, per audit M7), so the curve is evaluated in log space too.
         k_decades = _require('srdp_slope', 'slope')
-        baseline = fitted_params.get('baseline', 0.0)
+        # No default: a missing baseline silently drawn as 0 is a fabricated curve.
+        baseline = _require('srdp_baseline', 'baseline')
 
         f_fit = np.logspace(np.log10(freq.min()), np.log10(freq.max()), 300)
-        dg_fit = baseline + A / (
-            1 + np.exp(-(np.log10(f_fit) - np.log10(f0)) / k_decades)
-        )
+        from fitting import srdp_sigmoid_percent
+        dg_fit = srdp_sigmoid_percent(f_fit, baseline, A, f0, k_decades)
 
         ax.plot(f_fit, dg_fit, 'b-', linewidth=2.5, label='Fitted SRDP', zorder=2)
 
