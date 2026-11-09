@@ -73,7 +73,10 @@ BASELINE = {
     # rather than tightened to the measured accuracy: the underlying data still
     # carries 1.5% multiplicative noise, and a tolerance narrower than the
     # scatter would make this test flaky rather than strict.
-    "alpha": dict(status=PINNED, truth=0.75, baseline=0.7572, rel_tol=0.08,
+    # alpha now comes from the shared-shape trajectory fit over all 8
+    # potentiation traces (2026-11-09): -1.0% at this seed, +-0.9% across 8
+    # seeds, against +-5.8% for the single-trace increment method it replaced.
+    "alpha": dict(status=PINNED, truth=0.75, baseline=0.7425, rel_tol=0.05,
                   note="value is fine; provenance was not — see "
                        "test_alpha_is_fitted_from_the_dedicated_nonlinearity_trace"),
     "beta": dict(status=PINNED, truth=0.75, baseline=0.7556, rel_tol=0.08),
@@ -105,17 +108,19 @@ BASELINE = {
     # upper bound and reported as a successful extraction. Now +5%.
     "B_peak": dict(status=PINNED, truth=6e-4, baseline=6.033e-4, rel_tol=0.20),
 
-    # A_peak amplifies alpha's residual error through the power-law prefactor —
-    # the base (G_max - G) is ~1e-4, so a percent of exponent error becomes
-    # several percent here. At alpha = 0.757 that leaves +15%, down from +43%
-    # when relaxation was still being absorbed into the exponent.
-    "A_peak": dict(status=PINNED, truth=8e-4, baseline=9.196e-4, rel_tol=0.30,
-                   note="amplifies alpha's residual error through the "
-                        "power-law prefactor"),
+    # A_peak carries units S^(1-alpha), so alpha's error is amplified by
+    # |ln W| ~ 9. With alpha from the trajectory shape fit it is +0.1% here and
+    # +-7% across 8 seeds (was +15% here, +-49% across seeds). The physical rate
+    # k = A_peak * W^(alpha-1) is pinned separately below.
+    "A_peak": dict(status=PINNED, truth=8e-4, baseline=8.012e-4, rel_tol=0.20,
+                   note="inherits alpha's error times |ln W|"),
+    # Unit-independent rates, s^-1 per mW/cm^2; truth = peak * W^(exp-1), W = 99 uS.
+    "k_A_per_s_per_mW_cm2": dict(status=PINNED, truth=8.02e-3, baseline=8.618e-3, rel_tol=0.15),
+    "k_B_per_s_per_mW_cm2": dict(status=PINNED, truth=6.02e-3, baseline=5.754e-3, rel_tol=0.15),
 
     # --- fit quality ---
     "wavelength_fit_R2": dict(status=PINNED, truth=1.0, baseline=0.9774, min_value=0.90),
-    "nonlinearity_fit_R2": dict(status=PINNED, truth=1.0, baseline=0.9365, min_value=0.85),
+    "nonlinearity_fit_R2": dict(status=PINNED, truth=1.0, baseline=0.9995, min_value=0.98),
     "retention_fit_R2": dict(status=PINNED, truth=1.0, baseline=0.9988, min_value=0.95),
     "srdp_fit_R2": dict(status=PINNED, truth=1.0, baseline=0.9932, min_value=0.95),
     "stdp_fit_R2": dict(status=PINNED, truth=1.0, baseline=0.8668, min_value=0.75),

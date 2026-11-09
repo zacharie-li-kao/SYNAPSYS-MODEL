@@ -1620,6 +1620,18 @@ class SynapseSimulatorApp(ctk.CTk):
             f"  lambda_width: {base_params['lambda_width']:.1f} nm{_tag('lambda_width')}\n"
             f"  decay_tau:    {base_params['decay_tau']:.1f} s{_tag('decay_tau')}\n\n"
         )
+        # A_peak (units S^(1-alpha)) inherits alpha's error times |ln W|; the
+        # rate the data actually determine is k = A_peak * W^(alpha-1).
+        if fitted_model.get('k_A_per_s_per_mW_cm2') is not None:
+            unc = fitted_model.get('A_peak_rel_uncertainty_from_alpha')
+            self.fitting_results_text.insert("end",
+                f"  alpha method: {fitted_model.get('alpha_method', 'not recorded')}"
+                + (f", ±{fitted_model['alpha_stderr']:.3f}" if fitted_model.get('alpha_stderr') else "")
+                + "\n"
+                f"  k_A (rate):   {fitted_model['k_A_per_s_per_mW_cm2']:.3e} s⁻¹ per mW/cm²\n"
+                f"  k_B (rate):   {fitted_model['k_B_per_s_per_mW_cm2']:.3e} s⁻¹ per mW/cm²\n"
+                + (f"  A_peak carries ±{100 * unc:.0f}% from alpha alone\n" if unc is not None else "")
+                + "\n")
 
         # Fit quality, which the GUI previously discarded entirely.
         r2_keys = [

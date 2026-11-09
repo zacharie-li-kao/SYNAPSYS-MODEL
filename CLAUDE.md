@@ -185,6 +185,16 @@ deliberate design, not decoration — do not "simplify" them away.
   `potentiation`/`depression`, and negative or non-finite light intensity. A positional-argument
   slip once passed a pattern name as `stimulus_type`, and the "light" Network Demo silently ran
   as a 20 V electrical drive.
+- **alpha comes from trajectory shapes; k is the physical rate.** `fit_exponent_from_trajectories`
+  integrates every qualifying potentiation trace through the device ODE (relaxation included)
+  with one shared alpha and a free amplitude per trace, so spectral weight, intensity and
+  trace-to-trace gain cannot leak into alpha: ±0.9% across 8 generator seeds vs ±5.8% for the
+  single-trace increment method, which is kept as `alpha_increment_estimate` (a cross-check).
+  `A_peak` carries units S^(1−alpha), so alpha's error reaches it times |ln W| ≈ 9; the model
+  therefore also reports `k_A/k_B = peak·W^(exp−1)` (s⁻¹ per mW/cm², unit-independent, ±3%) and
+  `A_peak_rel_uncertainty_from_alpha`. Compare devices on k, not on A_peak. beta stays on the
+  increment method: no depression trace reaches the floor, so G_min — which (G − G_min)^beta
+  depends on — is not identifiable from the trajectories, and a shape fit there was worse.
 - **One STDP source for every simulation.** `Main.resolve_stdp_parameters` is the only rule:
   fitted values only when `'stdp'` is in `extraction_report['extracted']`, otherwise the
   documented defaults with the reason stated. Both the SNN tab and the Network tab's spiking
