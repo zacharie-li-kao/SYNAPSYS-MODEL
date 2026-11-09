@@ -4,13 +4,13 @@ Pulse schematic renderer for SYNAPSYS synapse mode.
 Draws live, dimensioned waveform diagrams of the stimulus and read channels
 for the selected synapse submode. Used by the Keithley controller to give
 the user an immediate visual readback of the pulse train they are designing
-— period, widths, delays, voltages, relay state — without having to run a
+— period, widths, delays and voltages — without having to run a
 measurement first.
 
 Rendering rules (must stay faithful to the physics in synapse_engine.py):
 - Source level is drawn as a piecewise-constant step.
-- When the source output is OFF (relay open), the level is drawn as a thin
-  dashed gray line at 0 V to indicate physical disconnect, not a driven 0 V.
+- Between pulses the stimulus output stays ON and drives 0 (0 V or 0 A):
+  every generator uses level steps, and offmode NORMAL never opens the relay.
 - Dimension arrows annotate period, widths, delays and measurement windows.
 - Voltages and timing values are shown numerically next to each element.
 - Time axis always covers ~1.5 periods so periodicity is visible.
@@ -294,8 +294,8 @@ def _render_basic(ax_stim, ax_read, p):
     Electrical pulse-read train.
 
     Per-period waveform mirrors generate_pulse_read_lua_script:
-      - Stim relay OFF at 0 V, then turns ON, level rises to stim_level for
-        stim_width, then output OFF again (relay open until next pulse).
+      - Stim output ON at 0 V for the whole train (offmode NORMAL never opens
+        the relay); the level steps to stim_level for stim_width, then back to 0.
       - Read stays at 0 V during stim; after stim_width + read_delay, goes
         up to read_voltage for read_settle + measurement_time; back to 0 V.
     """
@@ -370,19 +370,17 @@ def _render_basic(ax_stim, ax_read, p):
     period_one_end = max(sp_ms, sw_ms + max(0.0, rd_ms) + read_pulse_ms)
     t_end = period_one_end * 1.5
 
-    # --- Stim axis: two pulses, relay OFF between and at edges ---
+    # --- Stim axis: two pulses; output stays ON at 0 between them ---
     stim_segs = []
     for k in range(2):
         tk = k * sp_ms
-        # Relay OFF before pulse (level commanded to stim_level by LUA, but
-        # that only matters to the DUT when OUTPUT_ON — we draw it gray
-        # dashed at 0 since the external circuit is disconnected).
+        # 0 V before the pulse: the output is ON, driving 0.
         if k == 0:
             stim_segs.append({'t0': 0, 't1': tk, 'level': 0, 'on': False})
         # Pulse ON
         stim_segs.append({'t0': tk, 't1': tk + sw_ms,
                           'level': stim_lvl, 'on': True})
-        # Relay OFF after pulse until end of period
+        # Back to 0 V after the pulse until the end of the period
         stim_segs.append({'t0': tk + sw_ms, 't1': (k + 1) * sp_ms,
                           'level': 0, 'on': False})
     # Trim last segment to t_end
@@ -701,7 +699,7 @@ def _render_visual(ax_stim, ax_read, p):
 
     t_end = pp_ms * 1.5
 
-    # Stim waveform: LED pulses, relay toggled between pulses
+    # Stim waveform: LED pulses as level steps; output ON at 0 between them
     stim_segs = []
     for k in range(2):
         tk = k * pp_ms
@@ -830,7 +828,7 @@ def _render_cycle(ax_stim, ax_read, p):
 
     # Train A stim
     stim_segs = _add_train_stim(stim_segs, 0, a_params)
-    # Inter-train gap (relay OFF)
+    # Inter-train gap (stim at 0)
     if b_params:
         gap_start = a_duration
         gap_end = a_duration + inter_train_ms
@@ -874,17 +872,10 @@ def _render_cycle(ax_stim, ax_read, p):
     def _add_train_read(segs, start_t, tp):
         """Draw the read channel as the hardware actually drives it.
 
-        M25: this used to show the read channel sitting at 0 V for most of
-        every period, spiking to read_voltage only for a brief window. The
-        cycle LUA does the opposite — it holds the read channel AT read bias
-        continuously and drops to 0 V only while the stimulus pulse is applied
-        (`synapse_engine.py` cycle generator). At a 1000 ms period with a 1 ms
-        stimulus the device is biased for 999 ms of every period, while the
-        diagram showed roughly 50 ms: a ~20x understatement of read-disturb
-        exposure, which is exactly the quantity this diagram exists to convey.
-
-        The measurement APERTURE is drawn as a distinct emphasis within the
-        held bias, since that is a different thing from the bias itself.
+        Dual channel: the read SMU holds read bias for the whole train. Single
+        channel: the line returns to 0 V after each read, as in pulse-read, so
+        the diagram shows the real read-disturb exposure, which is what it is
+        for. The measurement aperture is drawn as a distinct emphasis.
         """
         n = tp['n_pulses']
         v_read = tp['read_voltage']
@@ -897,13 +888,16 @@ def _render_cycle(ax_stim, ax_read, p):
                              't1': tk, 'level': v_read, 'on': True})
 
             if single:
-                # One SMU does both: it must leave read bias to apply the
-                # stimulus, then return to it.
-                segs.append({'t0': tk, 't1': tk + tp['stim_width_ms'],
+                # One SMU does both. Like pulse-read, the line sits at 0 V
+                # between reads (limits read disturb): write pulse, read bias
+                # for read_delay + the ADC aperture, then back to 0 V.
+                t_rd = tk + tp['stim_width_ms']
+                t_back = min(t_rd + tp['read_delay_ms'] + tp['aperture_ms'],
+                             tk + tp['period_ms'])
+                segs.append({'t0': tk, 't1': t_rd, 'level': 0, 'on': True})
+                segs.append({'t0': t_rd, 't1': t_back, 'level': v_read, 'on': True})
+                segs.append({'t0': t_back, 't1': tk + tp['period_ms'],
                              'level': 0, 'on': True})
-                segs.append({'t0': tk + tp['stim_width_ms'],
-                             't1': tk + tp['period_ms'],
-                             'level': v_read, 'on': True})
             else:
                 # Dual channel: the read SMU is configured at read bias before
                 # the run and never leaves it.

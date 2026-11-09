@@ -23,6 +23,7 @@ import os
 from PIL import Image
 
 from assembly_helpers import load_characterization_suite
+import assembly_helpers
 import json
 from fitting import extract_synapse_model, plot_fitting_results
 import socket
@@ -307,6 +308,119 @@ def get_compliance_value():
 
     except (ValueError, KeyError, IndexError):
         raise ValueError(f"Invalid compliance value: {compliance_str}")
+
+
+# ==============================================================================
+# SHARED RUN HELPERS: execution report, readable errors, zero-bias warning
+# ==============================================================================
+
+def _walk_dicts(obj):
+    """Yield every dict nested in dicts/lists (numeric arrays cost one type test per item)."""
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _walk_dicts(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            if isinstance(v, (dict, list, tuple)):
+                yield from _walk_dicts(v)
+
+
+def _execution_summary(results, host_timed_by_design=False):
+    """What the engine reported about how a run was executed.
+
+    Returns (paths, problems, timing_note). Every key is read defensively: a
+    key the engine did not report is reported here as "not reported", never
+    assumed to mean success.
+    """
+    paths, problems = [], []
+    flags = []          # period_delivered values seen
+    for d in _walk_dicts(results):
+        ep = d.get('execution_path')
+        for p in (ep if isinstance(ep, (list, tuple)) else [ep]):
+            if isinstance(p, str) and p not in paths:
+                paths.append(p)
+        if 'period_delivered' in d and d['period_delivered'] is not None:
+            flags.append(d['period_delivered'])
+            if d['period_delivered'] is False:
+                delivered = ", ".join(
+                    f"{k}={v:g}" for k, v in d.items()
+                    if 'period' in k and k != 'period_delivered'
+                    and isinstance(v, (int, float)) and not isinstance(v, bool))
+                problems.append(
+                    "The requested pulse period was NOT delivered"
+                    + (f" ({delivered})." if delivered else " (the engine gave no figure)."))
+        if d.get('settle_warning'):
+            problems.append(f"Settling warning: {d['settle_warning']}")
+    if 'standard' in paths and not host_timed_by_design:
+        problems.append(
+            "Ran on the standard (PC-timed) path, not on the instrument (LUA): "
+            "pulse timing is limited by the host clock and the VISA link.")
+    if not flags:
+        timing_note = "not reported by the engine (period delivery is unverified)"
+    elif all(f is True for f in flags):
+        timing_note = "requested period delivered"
+    else:
+        timing_note = "period NOT delivered" if False in flags else "partly reported"
+    return paths, problems, timing_note
+
+
+def _show_run_outcome(results, what, host_timed_by_design=False, failures=()):
+    """The one place a run's completion is reported, with the path that ran.
+
+    `failures` (e.g. devices that errored) make it a warning that lists them:
+    a batch with a failed member is not a success.
+    """
+    paths, problems, timing_note = _execution_summary(results, host_timed_by_design)
+    problems = [f"FAILED - {f}" for f in failures] + problems
+    body = (f"{what} completed.\n"
+            f"Execution path: {', '.join(paths) if paths else 'not reported'}\n"
+            f"Timing: {timing_note}")
+    if problems:
+        messagebox.showwarning(
+            "Completed with failures" if failures else "Completed with warnings",
+            body + "\n\nThis run was not clean:\n- " + "\n- ".join(dict.fromkeys(problems)))
+    else:
+        messagebox.showinfo("Success", body)
+
+
+def _declined(label):
+    """A declined safety prompt must say so; returning silently looks like a hang."""
+    messagebox.showinfo("Cancelled",
+                        f"{label} was cancelled at the safety prompt. Nothing was measured.")
+
+
+def _warn_zero_read_voltage(read_voltage, label="Read voltage"):
+    """0 V read bias is allowed, but conductance is then undefined (NaN by design)."""
+    if read_voltage == 0:
+        messagebox.showwarning(
+            "Zero read voltage",
+            f"{label} is 0 V, so conductance G = I/V is undefined and will be NaN "
+            "throughout this run. Only the raw current is meaningful.")
+
+
+def _readable_error(exc):
+    """Message for an exception, with a raw VISA timeout translated."""
+    text = str(exc)
+    code = getattr(exc, 'error_code', None)
+    if 'VI_ERROR_TMO' in text or code == -1073807339:
+        return ("The instrument did not respond within the timeout (VISA timeout). "
+                "Check the connection and that no earlier script is still running, "
+                "or increase 'Timeout Duration (s)'.\n\nDetail: " + text)
+    return text
+
+
+def _parse_timeout_s(suggested_s):
+    """Timeout Duration (s). An invalid entry is refused, never replaced."""
+    try:
+        seconds = validate_float(timeout_entry.get(), "Timeout Duration", units="s")
+        if seconds <= 0:
+            raise ValueError("Timeout Duration: must be greater than zero.")
+    except ValueError as err:
+        raise ValueError(
+            f"{err}\nEnter the timeout in seconds (must be greater than zero). "
+            f"Suggested for this sequence: {suggested_s:.0f} s. Nothing was measured.")
+    return seconds
 
 def run_measurement_buffered(transistor_mode=False):
     global voltages, current_density, jv_curves
@@ -1036,24 +1150,28 @@ def run_srdp_characterization():
     _measurement_in_progress = True
     try:
         global synapse_data_storage
-    
+
         try:
             # Parse frequency range
             freq_start = validate_float(srdp_freq_start_entry.get(), "SRDP Start Frequency", minimum=1e-3, maximum=1e5, units="Hz", hint="Frequency must be positive; a log-spaced sweep is undefined at or below 0 Hz.")
             freq_end = validate_float(srdp_freq_end_entry.get(), "SRDP End Frequency", minimum=1e-3, maximum=1e5, units="Hz", hint="Frequency must be positive; a log-spaced sweep is undefined at or below 0 Hz.")
-            freq_points = int(validate_float(srdp_freq_points_entry.get(), "SRDP Frequency Points"))
-        
-            if freq_points < 2:
-                raise ValueError("Need at least 2 frequency points")
-        
+            freq_points = assembly_helpers.require_count(
+                validate_float(srdp_freq_points_entry.get(), "SRDP Frequency Points"),
+                "SRDP Frequency Points", minimum=2)
+            assembly_helpers.check_srdp_range(freq_start, freq_end, freq_points)
+
+            # A pulse count of 0 "completed" with empty arrays and -4 raised a
+            # bare IndexError mid-run, so it is refused here, before any
+            # instrument is opened.
+            n_pulses = assembly_helpers.require_count(
+                validate_float(srdp_n_pulses_entry.get(), "SRDP # Pulses"), "SRDP # Pulses")
+
             # Generate frequency list (log scale for better coverage)
             if srdp_log_scale_var.get():
                 freq_list = np.logspace(np.log10(freq_start), np.log10(freq_end), freq_points)
             else:
                 freq_list = np.linspace(freq_start, freq_end, freq_points)
-        
-            # Check if frequency range is achievable with current timing parameters.
-            #
+
             # H14: this ceiling used to omit `read_settle_delay_ms` and the ~2 ms
             # of per-pulse LUA overhead that pulse-read's own check includes, so it
             # reported a maximum the instrument could not actually deliver. A user
@@ -1061,107 +1179,108 @@ def run_srdp_characterization():
             # while results["frequencies_hz"] recorded 100 — and the SRDP x-axis is
             # wrong exactly where f0 and the slope are determined.
             stim_width = validate_float(srdp_stim_width_entry.get(), "SRDP Stim Width", minimum=1e-6, units="ms", hint="Must be greater than zero.")
-            read_delay = validate_float(read_delay_entry.get(), "Read Delay")
-            read_settle = validate_float(read_settle_delay_entry.get(), "Read Settle Delay")
+            read_delay = validate_float(read_delay_entry.get(), "Read Delay", minimum=0, units="ms")
+            read_settle = validate_float(read_settle_delay_entry.get(), "Read Settle Delay", minimum=0, units="ms")
             read_width = validate_float(read_width_entry.get(), "Read Pulse Width", minimum=1e-6, units="ms", hint="Must be greater than zero.")
             nplc_val = validate_float(nplc_entry.get(), "NPLC", minimum=0.001, maximum=25, units="power line cycles", hint="The 2600-series ADC accepts 0.001-25 NPLC; 1 NPLC = 20 ms at 50 Hz.")
-            # Compute actual measurement time (same logic as LUA script generator)
-            NPLC_PERIOD_MS = 1000.0 / synapse_engine.DEFAULT_LINE_FREQ_HZ
-            actual_nplc = min(nplc_val, read_width / NPLC_PERIOD_MS) if read_width > 0 else nplc_val
-            actual_nplc = max(0.001, actual_nplc)
-            meas_time = actual_nplc * NPLC_PERIOD_MS
-            LUA_PER_PULSE_OVERHEAD_MS = 2.0
-            min_period = (stim_width + read_delay + read_settle + meas_time
-                          + LUA_PER_PULSE_OVERHEAD_MS)
-            max_achievable_freq = 1000.0 / min_period
 
-            if freq_end > max_achievable_freq:
-                warning_msg = (
-                    f"⚠️ Frequency range warning:\n\n"
-                    f"Your timing parameters limit the maximum frequency:\n"
-                    f"  • Stim Width: {stim_width} ms\n"
-                    f"  • Read Delay: {read_delay} ms\n"
-                    f"  • Measurement Time: {meas_time:.2f} ms (NPLC={actual_nplc:.4f})\n"
-                    f"  • Min Period: {min_period:.2f} ms\n"
-                    f"  • Max Frequency: {max_achievable_freq:.1f} Hz\n\n"
-                    f"You requested up to {freq_end} Hz.\n"
-                    f"Higher frequencies will run as fast as the instrument can.\n\n"
-                    f"Continue?"
-                )
-
-                if not messagebox.askyesno("Frequency Range Warning", warning_msg):
-                    return
-        
             # Collect base parameters - USE SRDP-SPECIFIC FIELDS
             stim_ch_str = stim_channel_var.get().lower()
             read_ch_str = read_channel_var.get().lower()
-        
+
             if stim_ch_str == read_ch_str:
                 raise ValueError("Stim and Read channels must be different.")
-        
+
             base_params = {
                 "mode": "srdp",
                 "stim_drive_type": stim_drive_var.get(),
                 "stim_level": validate_float(srdp_stim_level_entry.get(), "SRDP Stim Level"),
-                "stim_width_ms": validate_float(srdp_stim_width_entry.get(), "SRDP Stim Width", minimum=1e-6, units="ms", hint="Must be greater than zero."),
-                "n_pulses": int(validate_float(srdp_n_pulses_entry.get(), "SRDP # Pulses")),
+                "stim_width_ms": stim_width,
+                "n_pulses": n_pulses,
                 "read_voltage": validate_float(read_voltage_entry.get(), "Read Voltage"),
-                "read_delay_ms": validate_float(read_delay_entry.get(), "Read Delay"),
-                "read_settle_delay_ms": validate_float(read_settle_delay_entry.get(), "Read Settle Delay"),
-                "read_width_ms": validate_float(read_width_entry.get(), "Read Pulse Width", minimum=1e-6, units="ms", hint="Must be greater than zero."),
+                "read_delay_ms": read_delay,
+                "read_settle_delay_ms": read_settle,
+                "read_width_ms": read_width,
                 "compliance_A": get_compliance_value(),
-                "nplc": validate_float(nplc_entry.get(), "NPLC", minimum=0.001, maximum=25, units="power line cycles", hint="The 2600-series ADC accepts 0.001-25 NPLC; 1 NPLC = 20 ms at 50 Hz."),
+                "nplc": nplc_val,
                 # H16: the documented line_freq_hz key, now actually supplied
                 # by the GUI instead of always falling back to 50 Hz.
                 "line_freq_hz": get_line_freq_hz(),
                 "settle_ms": 5,
-                "measure_avg": 1,       
+                "measure_avg": 1,
                 "wire_modes": build_wire_modes(),
                 "measure_avg_user": _read_samples_per_pulse(),
-                "wavelength_nm": validate_float(srdp_wavelength_entry.get(), "Wavelength"),
-                "intensity_mW_cm2": validate_float(srdp_light_intensity_entry.get(), "Light Intensity"),
+                "wavelength_nm": validate_float(srdp_wavelength_entry.get(), "Wavelength", minimum=0, units="nm"),
+                "intensity_mW_cm2": validate_float(srdp_light_intensity_entry.get(), "Light Intensity", minimum=0, units="mW/cm2"),
                 "sample_id": srdp_sample_id_entry.get().strip()
             }
-        
+            _warn_zero_read_voltage(base_params["read_voltage"])
+
+            def _ceiling_accepted(line_freq_hz):
+                """Frequency-ceiling prompt, at the line frequency actually in use
+                (an Auto setting is the instrument's detected mains, not 50 Hz)."""
+                nplc_period_ms = 1000.0 / line_freq_hz
+                actual_nplc = max(0.001, min(nplc_val, read_width / nplc_period_ms))
+                meas_time = actual_nplc * nplc_period_ms
+                LUA_PER_PULSE_OVERHEAD_MS = 2.0
+                min_period = (stim_width + read_delay + read_settle + meas_time
+                              + LUA_PER_PULSE_OVERHEAD_MS)
+                max_achievable_freq = 1000.0 / min_period
+                if freq_end <= max_achievable_freq:
+                    return True
+                return messagebox.askyesno("Frequency Range Warning", (
+                    f"⚠️ Frequency range warning:\n\n"
+                    f"Your timing parameters limit the maximum frequency:\n"
+                    f"  • Stim Width: {stim_width} ms\n"
+                    f"  • Read Delay: {read_delay} ms\n"
+                    f"  • Measurement Time: {meas_time:.2f} ms (NPLC={actual_nplc:.4f} at {line_freq_hz:g} Hz)\n"
+                    f"  • Min Period: {min_period:.2f} ms\n"
+                    f"  • Max Frequency: {max_achievable_freq:.1f} Hz\n\n"
+                    f"You requested up to {freq_end} Hz.\n"
+                    f"Higher frequencies will run as fast as the instrument can.\n\n"
+                    f"Continue?"))
+
             # Run measurement or simulation
             if simulate_var.get():
+                if not _ceiling_accepted(synapse_engine._line_freq_hz(base_params)):
+                    _declined("SRDP")
+                    return
                 results = synapse_engine.simulate_srdp(base_params, freq_list.tolist())
+                results.setdefault('execution_path', 'simulation')
                 messagebox.showinfo("Simulation", "SRDP simulation completed!")
             else:
                 port = port_entry.get().strip()
                 connection = connection_type.get()
-            
+
                 if not port:
                     raise ValueError("Port Address cannot be empty.")
-            
+
                 instrument = synapse_engine.open_instrument(port, connection)
-
-                # H15: one shared check, against the right limit for the drive type.
-                # This used to compare the stimulus VOLTAGE against 1.5 A on a
-                # hardcoded "2612B" substring match, refusing a 2 V pre-spike as
-                # "2.0A", while performing no voltage check at all.
                 try:
-                    if not check_synapse_safety(instrument, base_params, "SRDP"):
-                        instrument.close()
+                    # H15: one shared check, against the right limit for the drive
+                    # type. This used to compare the stimulus VOLTAGE against 1.5 A
+                    # on a hardcoded "2612B" substring match, refusing a 2 V pre-spike
+                    # as "2.0A", while performing no voltage check at all.
+                    check_instrument_limits(instrument, base_params, "SRDP")
+                    if not _ceiling_accepted(synapse_engine.resolve_line_freq(instrument, base_params)):
+                        _declined("SRDP")
                         return
-                except Exception:
-                    instrument.close()
-                    raise
-
-                try:
+                    if not check_synapse_safety(instrument, base_params, "SRDP"):
+                        _declined("SRDP")
+                        return
                     results = synapse_engine.measure_srdp(
                         instrument, stim_ch_str, read_ch_str, base_params, freq_list.tolist()
                     )
-                    messagebox.showinfo("Success", "SRDP characterization completed!")
                 finally:
                     instrument.close()
-        
+                _show_run_outcome(results, "SRDP characterization")
+
             # Plot and store results
             plot_srdp_data(results)
             register_synapse_run(results)
-        
+
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            messagebox.showerror("Error", _readable_error(e))
     finally:
         _measurement_in_progress = False
 
@@ -1182,37 +1301,42 @@ def run_stdp_characterization():
     _measurement_in_progress = True
     try:
         global synapse_data_storage
-    
+
         try:
             # Parse timing range
-            dt_start = validate_float(stdp_dt_start_entry.get(), "STDP Start Δt")
-            dt_end = validate_float(stdp_dt_end_entry.get(), "STDP End Δt")
-            dt_points = int(validate_float(stdp_dt_points_entry.get(), "STDP Δt Points"))
-        
-            if dt_points < 2:
-                raise ValueError("Need at least 2 timing points")
-        
-            # Generate Δt list
+            dt_start = validate_float(stdp_dt_start_entry.get(), "STDP Start Δt", units="ms")
+            dt_end = validate_float(stdp_dt_end_entry.get(), "STDP End Δt", units="ms")
+            dt_points = assembly_helpers.require_count(
+                validate_float(stdp_dt_points_entry.get(), "STDP Δt Points"),
+                "STDP Δt Points", minimum=2)
+            n_pairs = assembly_helpers.require_count(
+                validate_float(stdp_n_pairs_entry.get(), "# Spike Pairs"), "# Spike Pairs")
+            pulse_width = validate_float(stdp_pulse_width_entry.get(), "Pulse Width", minimum=1e-6, units="ms", hint="Must be greater than zero.")
+            pair_period = validate_float(stdp_pair_period_entry.get(), "Pair Period", minimum=1e-6, units="ms", hint="Must be greater than zero.")
+
+            # Generate Δt list, and validate the WHOLE sweep now: an unrunnable
+            # point used to fail mid-sweep, after hardware activity.
             delta_t_list = np.linspace(dt_start, dt_end, dt_points)
-        
+            assembly_helpers.check_stdp_plan(delta_t_list, pulse_width, pair_period)
+
             # Collect base parameters - USE STDP-SPECIFIC FIELDS
             stim_ch_str = stim_channel_var.get().lower()
             read_ch_str = read_channel_var.get().lower()
-        
+
             if stim_ch_str == read_ch_str:
                 raise ValueError("Stim and Read channels must be different.")
-        
+
             base_params = {
                 "mode": "stdp",
                 "stim_drive_type": "V",  # STDP typically uses voltage
                 "stim_level": validate_float(stdp_pre_level_entry.get(), "Pre-spike Level"),
                 "post_spike_level": validate_float(stdp_post_level_entry.get(), "Post-spike Level"),
-                "stim_width_ms": validate_float(stdp_pulse_width_entry.get(), "Pulse Width", minimum=1e-6, units="ms", hint="Must be greater than zero."),
-                "stim_period_ms": validate_float(stdp_pair_period_entry.get(), "Pair Period", minimum=1e-6, units="ms", hint="Must be greater than zero."),
-                "n_pulses": int(validate_float(stdp_n_pairs_entry.get(), "# Spike Pairs")),
+                "stim_width_ms": pulse_width,
+                "stim_period_ms": pair_period,
+                "n_pulses": n_pairs,
                 "read_voltage": validate_float(read_voltage_entry.get(), "Read Voltage"),
-                "read_delay_ms": validate_float(read_delay_entry.get(), "Read Delay"),
-                "read_settle_delay_ms": validate_float(read_settle_delay_entry.get(), "Read Settle Delay"),
+                "read_delay_ms": validate_float(read_delay_entry.get(), "Read Delay", minimum=0, units="ms"),
+                "read_settle_delay_ms": validate_float(read_settle_delay_entry.get(), "Read Settle Delay", minimum=0, units="ms"),
                 "read_width_ms": validate_float(read_width_entry.get(), "Read Pulse Width", minimum=1e-6, units="ms", hint="Must be greater than zero."),
                 "compliance_A": get_compliance_value(),
                 "nplc": validate_float(nplc_entry.get(), "NPLC", minimum=0.001, maximum=25, units="power line cycles", hint="The 2600-series ADC accepts 0.001-25 NPLC; 1 NPLC = 20 ms at 50 Hz."),
@@ -1223,65 +1347,53 @@ def run_stdp_characterization():
                 "measure_avg": 1,
                 "wire_modes": build_wire_modes(),
                 "measure_avg_user": _read_samples_per_pulse(),
-                "wavelength_nm": validate_float(stdp_wavelength_entry.get(), "Wavelength"),
-                "intensity_mW_cm2": validate_float(stdp_light_intensity_entry.get(), "Light Intensity"),
+                "wavelength_nm": validate_float(stdp_wavelength_entry.get(), "Wavelength", minimum=0, units="nm"),
+                "intensity_mW_cm2": validate_float(stdp_light_intensity_entry.get(), "Light Intensity", minimum=0, units="mW/cm2"),
                 "sample_id": stdp_sample_id_entry.get().strip()
             }
-        
+            _warn_zero_read_voltage(base_params["read_voltage"])
+
             # Run measurement or simulation
             if simulate_var.get():
                 results = synapse_engine.simulate_stdp(base_params, delta_t_list.tolist())
+                results.setdefault('execution_path', 'simulation')
                 messagebox.showinfo("Simulation", "STDP simulation completed!")
             else:
                 port = port_entry.get().strip()
                 connection = connection_type.get()
-            
+
                 if not port:
                     raise ValueError("Port Address cannot be empty.")
-            
+
                 instrument = synapse_engine.open_instrument(port, connection)
-            
-                # === DETECT INSTRUMENT MODEL ===
                 try:
-                    model = instrument.query("*IDN?")
-                    print(f"✓ Connected to: {model}")
-                
-                    pass
-                except Exception as e:
-                    print(f"Warning: Could not detect instrument model: {e}")
-
-                # H15: both spikes checked against the right limit for the drive
-                # type, plus the read voltage and the device-safety advisory. The
-                # old check compared a VOLTAGE against 1.5 A on a hardcoded
-                # "2612B" substring, and performed no voltage check whatsoever.
-                try:
-                    if not check_synapse_safety(instrument, base_params, "STDP pre-spike"):
-                        instrument.close()
-                        return
+                    # H15: both spikes checked against the right limit for the drive
+                    # type, plus the read voltage and the device-safety advisory.
+                    # Both limits are refused before EITHER advisory prompt.
                     post_params = dict(base_params)
-                    post_params['stim_level'] = base_params.get(
-                        'post_spike_level', base_params['stim_level'])
-                    if not check_synapse_safety(instrument, post_params, "STDP post-spike"):
-                        instrument.close()
+                    post_params['stim_level'] = base_params['post_spike_level']
+                    check_instrument_limits(instrument, base_params, "STDP pre-spike")
+                    check_instrument_limits(instrument, post_params, "STDP post-spike")
+                    if not check_synapse_safety(instrument, base_params, "STDP pre-spike"):
+                        _declined("STDP")
                         return
-                except Exception:
-                    instrument.close()
-                    raise
+                    if not check_synapse_safety(instrument, post_params, "STDP post-spike"):
+                        _declined("STDP")
+                        return
 
-                try:
                     results = synapse_engine.measure_stdp(
                         instrument, stim_ch_str, read_ch_str, base_params, delta_t_list.tolist()
                     )
-                    messagebox.showinfo("Success", "STDP characterization completed!")
                 finally:
                     instrument.close()
-        
+                _show_run_outcome(results, "STDP characterization")
+
             # Plot and store results
             plot_stdp_data(results)
             register_synapse_run(results)
-        
+
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            messagebox.showerror("Error", _readable_error(e))
     finally:
         _measurement_in_progress = False
 
@@ -1289,7 +1401,12 @@ def _collect_train_config(topo_var, ch_var, write_ch_var, read_ch_var,
                           stim_level_entry, stim_width_entry, period_entry,
                           n_pulses_entry, read_voltage_entry, read_delay_entry,
                           label):
-    """Builds a train config dict from GUI widget values."""
+    """Builds a train config dict from GUI widget values.
+
+    Pure parsing: the device-safety confirmation is NOT asked here. It used to be
+    asked here AND again by check_synapse_safety, so a hardware run showed the
+    same prompt twice (and a simulation, which drives nothing, showed it once).
+    """
     topo_str = topo_var.get()
     if topo_str == "Single SMU":
         topology = "single"
@@ -1302,33 +1419,26 @@ def _collect_train_config(topo_var, ch_var, write_ch_var, read_ch_var,
         if write_ch == read_ch:
             raise ValueError(f"{label}: Dual-channel mode requires different Write and Read channels.")
 
-    # Device-safety confirmation. Basic mode checks its stimulus level and
-    # Visual mode checks its LED voltage, but Cycle mode checked NOTHING — a
-    # mistyped 50 in the Write Level box ran unchallenged all the way up to the
-    # instrument ceiling, across every cycle of the train.
-    _write_level = validate_float(stim_level_entry.get(), f"{label} Write Level")
-    if not synapse_engine.safety_check(_write_level, drive_type="V"):
-        raise ValueError(
-            f"{label}: cancelled at the write-level safety prompt "
-            f"({_write_level:g} V). Nothing was measured."
-        )
+    _read_voltage = validate_float(read_voltage_entry.get(), f"{label} Read Voltage")
+    _warn_zero_read_voltage(_read_voltage, f"{label} read voltage")
 
     return {
         "topology": topology,
         "write_ch": write_ch,
         "read_ch": read_ch,
         "stim_drive_type": "V",
-        "stim_level": _write_level,
+        "stim_level": validate_float(stim_level_entry.get(), f"{label} Write Level"),
         "stim_width_ms": validate_float(stim_width_entry.get(), f"{label} Write Width", minimum=1e-6, units="ms", hint="Must be greater than zero."),
         "stim_period_ms": validate_float(period_entry.get(), f"{label} Period", minimum=1e-6, units="ms", hint="Must be greater than zero."),
-        "n_pulses": int(validate_float(n_pulses_entry.get(), f"{label} # Pulses")),
-        "read_voltage": validate_float(read_voltage_entry.get(), f"{label} Read Voltage"),
-        "read_delay_ms": validate_float(read_delay_entry.get(), f"{label} Read Delay"),
+        "n_pulses": assembly_helpers.require_count(
+            validate_float(n_pulses_entry.get(), f"{label} # Pulses"), f"{label} # Pulses"),
+        "read_voltage": _read_voltage,
+        "read_delay_ms": validate_float(read_delay_entry.get(), f"{label} Read Delay", minimum=0, units="ms"),
         "compliance_A": get_compliance_value(),
         "nplc": validate_float(nplc_entry.get(), "NPLC", minimum=0.001, maximum=25, units="power line cycles", hint="The 2600-series ADC accepts 0.001-25 NPLC; 1 NPLC = 20 ms at 50 Hz."),
-                # H16: the documented line_freq_hz key, now actually supplied
-                # by the GUI instead of always falling back to 50 Hz.
-                "line_freq_hz": get_line_freq_hz(),
+        # H16: the documented line_freq_hz key, now actually supplied
+        # by the GUI instead of always falling back to 50 Hz.
+        "line_freq_hz": get_line_freq_hz(),
         "settle_ms": 5,
         "wire_modes": build_wire_modes(),
         "measure_avg_user": _read_samples_per_pulse(),
@@ -1336,9 +1446,55 @@ def _collect_train_config(topo_var, ch_var, write_ch_var, read_ch_var,
     }
 
 
+def _train_configs():
+    """(Train A config, Train B config or None) from the Cycle widgets."""
+    train_a_config = _collect_train_config(
+        cycle_train_a_topo_var, cycle_train_a_ch_var,
+        cycle_train_a_write_ch_var, cycle_train_a_read_ch_var,
+        train_a_stim_level_entry, train_a_stim_width_entry,
+        train_a_period_entry, train_a_n_pulses_entry,
+        train_a_read_voltage_entry, train_a_read_delay_entry,
+        "Train A")
+
+    train_b_config = None
+    if cycle_enable_train_b_var.get():
+        train_b_config = _collect_train_config(
+            cycle_train_b_topo_var, cycle_train_b_ch_var,
+            cycle_train_b_write_ch_var, cycle_train_b_read_ch_var,
+            train_b_stim_level_entry, train_b_stim_width_entry,
+            train_b_period_entry, train_b_n_pulses_entry,
+            train_b_read_voltage_entry, train_b_read_delay_entry,
+            "Train B")
+    return train_a_config, train_b_config
+
+
+def _confirm_trains(instrument, trains):
+    """Safety gate for every train: all limits first, then each prompt once.
+
+    Returns False (after telling the user) if any prompt is declined.
+    """
+    live = [(label, cfg) for label, cfg in trains if cfg is not None]
+    for label, cfg in live:
+        check_instrument_limits(instrument, cfg, label)
+    for label, cfg in live:
+        if not check_synapse_safety(instrument, cfg, label):
+            _declined(label)
+            return False
+    return True
+
+
 def run_cycle_characterization():
     """Runs unified LUA-based cycle characterization with real-time plotting."""
     global _measurement_in_progress
+
+    # Multi-Device is dispatched BEFORE the re-entrancy guard is taken. The
+    # guard used to be set first, so run_multi_device_characterization found it
+    # set, took it for a concurrent run, and refused: the Multi-Device button
+    # (which is bound to this function) could never start a run.
+    if multi_device_var.get():
+        run_multi_device_characterization()
+        return
+
     if _measurement_in_progress:
         messagebox.showwarning(
             "Measurement In Progress",
@@ -1353,38 +1509,13 @@ def run_cycle_characterization():
         global synapse_data_storage
 
         try:
-            # Check if multi-device mode is enabled
-            if multi_device_var.get():
-                run_multi_device_characterization()
-                return
-
-            # Build Train A config
-            train_a_config = _collect_train_config(
-                cycle_train_a_topo_var, cycle_train_a_ch_var,
-                cycle_train_a_write_ch_var, cycle_train_a_read_ch_var,
-                train_a_stim_level_entry, train_a_stim_width_entry,
-                train_a_period_entry, train_a_n_pulses_entry,
-                train_a_read_voltage_entry, train_a_read_delay_entry,
-                "Train A")
-
-            # Build Train B config (if enabled)
-            train_b_config = None
-            if cycle_enable_train_b_var.get():
-                train_b_config = _collect_train_config(
-                    cycle_train_b_topo_var, cycle_train_b_ch_var,
-                    cycle_train_b_write_ch_var, cycle_train_b_read_ch_var,
-                    train_b_stim_level_entry, train_b_stim_width_entry,
-                    train_b_period_entry, train_b_n_pulses_entry,
-                    train_b_read_voltage_entry, train_b_read_delay_entry,
-                    "Train B")
+            train_a_config, train_b_config = _train_configs()
 
             # Cycle control
-            n_cycles = int(validate_float(cycle_n_cycles_entry.get(), "# Cycles"))
-            inter_train_delay = validate_float(cycle_inter_train_delay_entry.get(), "Inter-train Delay")
-            inter_cycle_delay = validate_float(cycle_delay_entry.get(), "Inter-cycle Delay")
-
-            if n_cycles <= 0:
-                raise ValueError("Number of cycles must be greater than zero")
+            n_cycles = assembly_helpers.require_count(
+                validate_float(cycle_n_cycles_entry.get(), "# Cycles"), "# Cycles")
+            inter_train_delay = validate_float(cycle_inter_train_delay_entry.get(), "Inter-train Delay", minimum=0, units="ms")
+            inter_cycle_delay = validate_float(cycle_delay_entry.get(), "Inter-cycle Delay", minimum=0, units="ms")
 
             # Real-time update callback
             def update_plot(results):
@@ -1405,6 +1536,7 @@ def run_cycle_characterization():
                     train_a_config, train_b_config, n_cycles,
                     update_callback=update_plot
                 )
+                results.setdefault('execution_path', 'simulation')
                 messagebox.showinfo("Simulation", "Cycle simulation completed!")
             else:
                 port = port_entry.get().strip()
@@ -1414,31 +1546,21 @@ def run_cycle_characterization():
                     raise ValueError("Port Address cannot be empty.")
 
                 instrument = synapse_engine.open_instrument(port, connection)
-
-                # H15: cycle mode performed NO safety check of any kind — neither
-                # an instrument limit nor the device-safety advisory that Basic and
-                # Visual both apply. Each train is checked separately, because each
-                # carries its own drive type, stimulus level and read voltage.
                 try:
-                    for label, cfg in (("Cycle Train A", train_a_config),
-                                       ("Cycle Train B", train_b_config)):
-                        if cfg is None:
-                            continue
-                        if not check_synapse_safety(instrument, cfg, label):
-                            instrument.close()
-                            return
-                except Exception:
-                    instrument.close()
-                    raise
-
-                try:
+                    # H15: cycle mode performed NO safety check of any kind. Each
+                    # train goes through check_synapse_safety (via _confirm_trains)
+                    # separately, because each carries its own drive type,
+                    # stimulus level and read voltage.
+                    if not _confirm_trains(instrument, (("Cycle Train A", train_a_config),
+                                                        ("Cycle Train B", train_b_config))):
+                        return
                     results = synapse_cycle.cycle_sequence(
                         instrument, train_a_config, train_b_config, n_cycles,
                         inter_train_delay, inter_cycle_delay
                     )
-                    messagebox.showinfo("Success", "Cycle characterization completed!")
                 finally:
                     instrument.close()
+                _show_run_outcome(results, "Cycle characterization")
 
             # Final plot update
             plot_cycle_data(results)
@@ -1447,9 +1569,30 @@ def run_cycle_characterization():
             register_synapse_run(results)
 
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            messagebox.showerror("Error", _readable_error(e))
     finally:
         _measurement_in_progress = False
+
+
+def _split_multi_results(results):
+    """(results restricted to the devices that succeeded, or None; failure lines).
+
+    A device that failed carries an 'error' key and no data. Storing it beside
+    the good ones, or reporting the batch as a success, presents a failure as a
+    measurement.
+    """
+    ok = [d for d in results['devices'] if 'error' not in d]
+    failures = [f"{d.get('device_name', '?')}: {d['error']}"
+                for d in results['devices'] if 'error' in d]
+    if not ok:
+        return None, failures
+    kept = dict(results)
+    kept['devices'] = ok
+    kept['device_names'] = [d['device_name'] for d in ok]
+    kept['n_devices'] = len(ok)
+    kept['failed_devices'] = failures
+    return kept, failures
+
 
 def run_multi_device_characterization():
     """Runs cycling across multiple devices sequentially."""
@@ -1469,35 +1612,18 @@ def run_multi_device_characterization():
 
         try:
             # Get multi-device parameters
-            n_devices = int(validate_float(n_devices_entry.get(), "# Devices"))
-            inter_device_delay = validate_float(inter_device_delay_entry.get(), "Inter-device Delay")
+            n_devices = assembly_helpers.require_count(
+                validate_float(n_devices_entry.get(), "# Devices"), "# Devices")
+            inter_device_delay = validate_float(inter_device_delay_entry.get(), "Inter-device Delay", minimum=0, units="ms")
             device_name_pattern = device_name_pattern_entry.get().strip()
 
-            if n_devices <= 0:
-                raise ValueError("Number of devices must be greater than zero")
-
             # Build train configs (same for all devices)
-            train_a_config = _collect_train_config(
-                cycle_train_a_topo_var, cycle_train_a_ch_var,
-                cycle_train_a_write_ch_var, cycle_train_a_read_ch_var,
-                train_a_stim_level_entry, train_a_stim_width_entry,
-                train_a_period_entry, train_a_n_pulses_entry,
-                train_a_read_voltage_entry, train_a_read_delay_entry,
-                "Train A")
+            train_a_config, train_b_config = _train_configs()
 
-            train_b_config = None
-            if cycle_enable_train_b_var.get():
-                train_b_config = _collect_train_config(
-                    cycle_train_b_topo_var, cycle_train_b_ch_var,
-                    cycle_train_b_write_ch_var, cycle_train_b_read_ch_var,
-                    train_b_stim_level_entry, train_b_stim_width_entry,
-                    train_b_period_entry, train_b_n_pulses_entry,
-                    train_b_read_voltage_entry, train_b_read_delay_entry,
-                    "Train B")
-
-            n_cycles = int(validate_float(cycle_n_cycles_entry.get(), "# Cycles"))
-            inter_train_delay = validate_float(cycle_inter_train_delay_entry.get(), "Inter-train Delay")
-            inter_cycle_delay = validate_float(cycle_delay_entry.get(), "Inter-cycle Delay")
+            n_cycles = assembly_helpers.require_count(
+                validate_float(cycle_n_cycles_entry.get(), "# Cycles"), "# Cycles")
+            inter_train_delay = validate_float(cycle_inter_train_delay_entry.get(), "Inter-train Delay", minimum=0, units="ms")
+            inter_cycle_delay = validate_float(cycle_delay_entry.get(), "Inter-cycle Delay", minimum=0, units="ms")
 
             # The Multi-Device panel's own fields. These were displayed with
             # defaults and then read by NOTHING: a batch measured at 365 nm
@@ -1547,6 +1673,7 @@ def run_multi_device_characterization():
                 results = synapse_cycle.simulate_multi_device_cycles(
                     device_configs, update_callback=update_plot
                 )
+                results.setdefault('execution_path', 'simulation')
                 messagebox.showinfo("Simulation", f"Multi-device simulation completed for {n_devices} devices!")
             else:
                 port = port_entry.get().strip()
@@ -1555,33 +1682,44 @@ def run_multi_device_characterization():
                 if not port:
                     raise ValueError("Port Address cannot be empty.")
 
-                confirm = messagebox.askyesno(
-                    "Confirm Multi-Device Measurement",
-                    f"This will sequentially measure {n_devices} devices.\n"
-                    f"Each device will undergo {n_cycles} cycles.\n\n"
-                    f"This may take a long time. Continue?"
-                )
-                if not confirm:
-                    return
-
                 instrument = synapse_engine.open_instrument(port, connection)
-
                 try:
+                    # The same check_synapse_safety gate the Cycle path has (via
+                    # _confirm_trains); this path had none, so an over-limit
+                    # level went to the instrument unchallenged for every device.
+                    if not _confirm_trains(instrument, (("Multi-device Train A", train_a_config),
+                                                        ("Multi-device Train B", train_b_config))):
+                        return
+                    if not messagebox.askyesno(
+                            "Confirm Multi-Device Measurement",
+                            f"This will sequentially measure {n_devices} devices.\n"
+                            f"Each device will undergo {n_cycles} cycles.\n\n"
+                            f"This may take a long time. Continue?"):
+                        _declined("Multi-device measurement")
+                        return
                     results = synapse_cycle.run_multi_device_cycles(
                         instrument, device_configs, update_callback=update_plot
                     )
-                    messagebox.showinfo("Success", f"Multi-device characterization completed for {n_devices} devices!")
                 finally:
                     instrument.close()
 
-            # Final plot update
+            # Plot always (the plot labels failed devices as ERROR); store and
+            # report success only for what actually succeeded.
             plot_multi_device_data(results)
-
-            # Store results
-            register_synapse_run(results)
+            kept, failures = _split_multi_results(results)
+            if kept is None:
+                messagebox.showerror(
+                    "Multi-device measurement failed",
+                    f"All {n_devices} devices failed; nothing was stored.\n\n- "
+                    + "\n- ".join(failures))
+                return
+            _show_run_outcome(
+                kept, f"Multi-device characterization ({len(kept['devices'])} of {n_devices} devices)",
+                failures=failures)
+            register_synapse_run(kept)
 
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            messagebox.showerror("Error", _readable_error(e))
     finally:
         _measurement_in_progress = False
 
@@ -1771,6 +1909,7 @@ SYNAPSE_LABEL_BY_MODE.update({
     'stdp': 'STDP',
     'visual_standard': 'Visual (Self-Powered)',
     'visual_continuous': 'Visual Continuous I(t)',
+    'retention': 'Retention',
 })
 
 
@@ -1817,25 +1956,12 @@ def measurement_guard(label):
     return _Guard()
 
 
-def check_synapse_safety(instrument, params, mode_label):
-    """Validate stimulus and read levels against the instrument and the device.
+def check_instrument_limits(instrument, params, mode_label):
+    """Refuse a stimulus or read level the instrument cannot source.
 
-    H15: SRDP and STDP compared a VOLTAGE against the 1.5 A current limit, so a
-    2 V STDP pre-spike was refused on a 2612B as "2.0A" — while neither mode
-    performed any voltage limit check at all, and neither called
-    synapse_engine.safety_check(). Cycle mode called neither. Basic and Visual
-    both did, so the same stimulus was accepted or refused depending only on
-    which tab it was launched from.
-
-    Checks, in order:
-      1. the stimulus against the instrument's ceiling for its OWN drive type,
-      2. the read voltage against the voltage ceiling (it is applied to the
-         device for the whole inter-pulse period in some modes),
-      3. the device-safety advisory, which asks the user to confirm.
-
-    Returns True to proceed. Raises ValueError on an instrument limit — that is
-    a hardware constraint, not a preference — and returns False if the user
-    declines the device-safety prompt.
+    Raises ValueError. Callers run this for EVERY level of a run before the
+    first "proceed?" prompt: a prompt asks the user to weigh a risk, and it is
+    meaningless to ask about a level the hardware will refuse anyway.
     """
     drive_type = params.get('stim_drive_type', 'V')
     stim_level = abs(float(params.get('stim_level', 0.0)))
@@ -1864,13 +1990,37 @@ def check_synapse_safety(instrument, params, mode_label):
             f"maximum of {max_voltage} V."
         )
 
+
+def check_synapse_safety(instrument, params, mode_label, max_safe_voltage=None):
+    """Validate stimulus and read levels against the instrument and the device.
+
+    H15: SRDP and STDP compared a VOLTAGE against the 1.5 A current limit, so a
+    2 V STDP pre-spike was refused on a 2612B as "2.0A" — while neither mode
+    performed any voltage limit check at all, and neither called
+    synapse_engine.safety_check(). Cycle mode called neither. Basic and Visual
+    both did, so the same stimulus was accepted or refused depending only on
+    which tab it was launched from.
+
+    Checks, in order:
+      1. the stimulus against the instrument's ceiling for its OWN drive type,
+      2. the read voltage against the voltage ceiling (it is applied to the
+         device for the whole inter-pulse period in some modes),
+      3. the device-safety advisory, which asks the user to confirm.
+
+    Returns True to proceed. Raises ValueError on an instrument limit — that is
+    a hardware constraint, not a preference — and returns False if the user
+    declines the device-safety prompt (the caller reports that with _declined).
+    `max_safe_voltage` overrides the advisory threshold (e.g. an LED).
+    """
+    check_instrument_limits(instrument, params, mode_label)
+
     # Device-safety advisory, in the units actually being driven. This used to
     # run ONLY for voltage drive, so a current stimulus — where the compliance
     # field does not limit the sourced quantity at all — was never checked.
-    if not synapse_engine.safety_check(stim_level, drive_type=drive_type):
-        return False
-
-    return True
+    extra = {} if max_safe_voltage is None else {'max_safe_voltage': max_safe_voltage}
+    return bool(synapse_engine.safety_check(
+        abs(float(params.get('stim_level', 0.0))),
+        drive_type=params.get('stim_drive_type', 'V'), **extra))
 
 
 def synapse_mode_display(mode):
@@ -1909,41 +2059,36 @@ def run_synapse_mode():
     Handles both hardware measurements and simulation.
     """
     global synapse_data_storage
-    
+
     try:
         # Validate channel selection
         stim_ch_str = stim_channel_var.get().lower()
         read_ch_str = read_channel_var.get().lower()
-        
+
         if stim_ch_str == read_ch_str:
             raise ValueError("Stim and Read channels must be different (smua/smub).")
-        
-        # Parse and validate all parameters
+
+        # Parse and validate every parameter before any instrument is touched.
         stim_level = validate_float(stim_level_entry.get(), "Stim Level")
         stim_width = validate_float(stim_width_entry.get(), "Stim Width", minimum=1e-6, units="ms", hint="Must be greater than zero.")
         stim_period = validate_float(stim_period_entry.get(), "Stim Period", minimum=1e-6, units="ms", hint="Must be greater than zero.")
-        n_pulses = int(validate_float(n_pulses_entry.get(), "# Pulses"))
+        n_pulses = assembly_helpers.require_count(
+            validate_float(n_pulses_entry.get(), "# Pulses"), "# Pulses",
+            maximum=synapse_engine.KEITHLEY_MAX_BUFFER_SIZE - 1,
+            limit_name=(f"the Keithley buffer holds {synapse_engine.KEITHLEY_MAX_BUFFER_SIZE} "
+                        "points and the baseline read uses one"))
         read_voltage = validate_float(read_voltage_entry.get(), "Read Voltage")
-        read_delay = validate_float(read_delay_entry.get(), "Read Delay")
+        read_delay = validate_float(read_delay_entry.get(), "Read Delay", minimum=0, units="ms")
+        read_settle = validate_float(read_settle_delay_entry.get(), "Read Settle Delay", minimum=0, units="ms")
         compliance_A = get_compliance_value()
-        
+
         # Validation checks
         if stim_period < stim_width:
             raise ValueError("Stim Period must be >= Stim Width")
-        
-        if n_pulses <= 0:
-            raise ValueError("Number of pulses must be greater than zero")
-        
+
         if compliance_A <= 0:
             raise ValueError("Compliance must be greater than zero")
-        
-        # Safety check for high stimulus levels, in the driven units. Reading
-        # the drive type matters: in current mode `stim_level` is amperes, and
-        # comparing it against a voltage threshold passed 1 A unchallenged.
-        if not synapse_engine.safety_check(stim_level,
-                                           drive_type=stim_drive_var.get()):
-            return
-        
+
         # Collect parameters
         params = {
             "mode": canonical_synapse_mode(synapse_mode_selection.get()),
@@ -1954,119 +2099,59 @@ def run_synapse_mode():
             "n_pulses": n_pulses,
             "read_voltage": read_voltage,
             "read_delay_ms": read_delay,
-            "read_settle_delay_ms": validate_float(read_settle_delay_entry.get(), "Read Settle Delay"),
+            "read_settle_delay_ms": read_settle,
             "read_width_ms": validate_float(read_width_entry.get(), "Read Pulse Width", minimum=1e-6, units="ms", hint="Must be greater than zero."),
             "compliance_A": compliance_A,
             "nplc": validate_float(nplc_entry.get(), "NPLC", minimum=0.001, maximum=25, units="power line cycles", hint="The 2600-series ADC accepts 0.001-25 NPLC; 1 NPLC = 20 ms at 50 Hz."),
-                # H16: the documented line_freq_hz key, now actually supplied
-                # by the GUI instead of always falling back to 50 Hz.
-                "line_freq_hz": get_line_freq_hz(),
+            # H16: the documented line_freq_hz key, now actually supplied
+            # by the GUI instead of always falling back to 50 Hz.
+            "line_freq_hz": get_line_freq_hz(),
             "measure_avg": 1,
             "settle_ms": 5,
             "wire_modes": build_wire_modes(),
             "measure_avg_user": _read_samples_per_pulse(),
-            "wavelength_nm": validate_float(wavelength_entry.get(), "Wavelength"),
-            "intensity_mW_cm2": validate_float(light_intensity_entry.get(), "Light Intensity"),
+            "wavelength_nm": validate_float(wavelength_entry.get(), "Wavelength", minimum=0, units="nm"),
+            "intensity_mW_cm2": validate_float(light_intensity_entry.get(), "Light Intensity", minimum=0, units="mW/cm2"),
             "sample_id": sample_id_entry.get().strip()
         }
-                
+        _warn_zero_read_voltage(read_voltage)
+
         # Run measurement or simulation
         if simulate_var.get():
-            # Simulation mode
+            # Safety check for high stimulus levels, in the driven units. Reading
+            # the drive type matters: in current mode `stim_level` is amperes, and
+            # comparing it against a voltage threshold passed 1 A unchallenged.
+            if not synapse_engine.safety_check(stim_level, drive_type=stim_drive_var.get()):
+                _declined("Simulation")
+                return
             results = synapse_engine.simulate_pulse_read(params)
+            results.setdefault('execution_path', 'simulation')
             messagebox.showinfo("Simulation", "Simulation completed successfully!")
         else:
-            # Hardware mode
             port = port_entry.get().strip()
             connection = connection_type.get()
-            
+
             if not port:
                 raise ValueError("Port Address cannot be empty.")
-            
-            # Open instrument
+
+            # Refuse an invalid timeout rather than substituting one, and do it
+            # before the instrument is opened.
+            timeout_s = _parse_timeout_s(max(5.0, stim_period * n_pulses / 1000.0 * 1.5))
+
             instrument = synapse_engine.open_instrument(port, connection)
-            
-            
-            # === DETECT INSTRUMENT MODEL ===
             try:
-                model = instrument.query("*IDN?")
-                print(f"✓ Connected to: {model}")
-
-                # Check if current exceeds 2612B capability (only for current mode)
-                if "2612B" in model and params['stim_drive_type'] == "I":
-                    stim_current = abs(params['stim_level'])
-                    if stim_current > 1.5:
-                        instrument.close()
-                        messagebox.showerror(
-                            "Current Limit Exceeded",
-                            f"ERROR: 2612B maximum current is 1.5A\n\n"
-                            f"You requested: {stim_current}A\n\n"
-                            f"Solutions:\n"
-                            f"  • Reduce Stim Level to ≤1.5A, or\n"
-                            f"  • Use Keithley 2636A (supports up to 10A)"
-                        )
-                        return
-
-                # Check voltage limits for 2600B series (voltage mode only)
-                # Low voltage models (2601B/02B/04B): 40V limit
-                # High voltage models (2611B/12B/14B/3xB): 200V limit
-                if params['stim_drive_type'] == "V":
-                    max_voltage_instr = synapse_engine.get_max_voltage(instrument)
-                    stim_voltage = abs(params['stim_level'])
-                    read_voltage = abs(params['read_voltage'])
-                    requested_voltage = max(stim_voltage, read_voltage)
-
-                    if requested_voltage > max_voltage_instr:
-                        instrument.close()
-                        messagebox.showerror(
-                            "Voltage Limit Exceeded",
-                            f"ERROR: Instrument voltage limit exceeded.\n\n"
-                            f"Instrument: {model.strip()}\n"
-                            f"Maximum voltage: {max_voltage_instr}V\n"
-                            f"Requested voltage: {requested_voltage}V\n\n"
-                            f"Please reduce voltage levels to ≤{max_voltage_instr}V."
-                        )
-                        return
-            except Exception as e:
-                print(f"⚠️  Warning: Could not detect instrument model: {e}")
-            
-            
-            # Configure timeout
-            try:
-                user_timeout = validate_float(timeout_entry.get(), "Timeout Duration")
-                if user_timeout <= 0:
-                    raise ValueError("Timeout duration must be greater than zero.")
-                timeout_value = user_timeout * 1000
-            except ValueError as timeout_error:
-                # Refuse rather than silently substituting a computed value:
-                # the user typed something, and overriding their intent with
-                # no dialog and no console line destroyed both the value and
-                # the message explaining why it was rejected.
-                suggested_s = max(5.0, (params['stim_period_ms']
-                                        * params['n_pulses']) / 1000.0 * 1.5)
-                raise ValueError(
-                    f"Timeout Duration: {timeout_error}\n"
-                    f"Enter the timeout in seconds (must be greater than zero). "
-                    f"Suggested for this sequence: {suggested_s:.0f} s "
-                    f"(n_pulses x stim_period x 1.5). Nothing was measured."
-                )
-            
-            instrument.timeout = timeout_value
-            
-            try:
-                # Run the pulse-read sequence
+                # Instrument limits are refused before any "proceed?" prompt;
+                # an unidentifiable instrument raises here and nothing runs.
+                if not check_synapse_safety(instrument, params, "Basic"):
+                    _declined("Measurement")
+                    return
+                instrument.timeout = timeout_s * 1000
                 results = synapse_engine.pulse_read_sequence(
-                    instrument, 
-                    stim_ch_str, 
-                    read_ch_str, 
-                    params
-                )
-                messagebox.showinfo("Success", "Synapse measurement completed successfully!")
-                
+                    instrument, stim_ch_str, read_ch_str, params)
             finally:
-                # Close instrument
                 instrument.close()
-        
+            _show_run_outcome(results, "Synapse measurement")
+
         # Plot results
         plot_synapse_data(results)
 
@@ -2074,7 +2159,7 @@ def run_synapse_mode():
         register_synapse_run(results)
 
     except Exception as e:
-        messagebox.showerror("Error", str(e))
+        messagebox.showerror("Error", _readable_error(e))
 
 
 def run_visual_synapse_mode():
@@ -2093,14 +2178,19 @@ def run_visual_synapse_mode():
             raise ValueError("Stim (LED) and Read (Device) channels must be different.")
 
         # Parse visual synapse parameters
-        light_voltage = validate_float(visual_light_voltage_entry.get(), "Light Pulse Voltage")
+        light_voltage = validate_float(visual_light_voltage_entry.get(), "Light Pulse Voltage", minimum=0, units="V", hint="The LED is driven forward; a negative voltage is not a light pulse.")
         pulse_width = validate_float(visual_pulse_width_entry.get(), "Pulse Width", minimum=1e-6, units="ms", hint="Must be greater than zero.")
         pulse_period = validate_float(visual_pulse_period_entry.get(), "Pulse Period", minimum=1e-6, units="ms", hint="Must be greater than zero.")
-        n_pulses = int(validate_float(visual_n_pulses_entry.get(), "# Pulses"))
-        measure_start_delay = validate_float(visual_measure_start_entry.get(), "Measure Start Delay")
-        measure_end_margin = validate_float(visual_measure_end_entry.get(), "Measure End Margin")
-        readings_per_pulse = int(validate_float(visual_readings_per_pulse_entry.get(), "Readings per Pulse"))
-        sample_interval = validate_float(visual_sample_interval_entry.get(), "Sample Interval")
+        n_pulses = assembly_helpers.require_count(
+            validate_float(visual_n_pulses_entry.get(), "# Pulses"), "# Pulses",
+            maximum=synapse_engine.KEITHLEY_MAX_BUFFER_SIZE,
+            limit_name=f"the Keithley buffer holds {synapse_engine.KEITHLEY_MAX_BUFFER_SIZE} points")
+        measure_start_delay = validate_float(visual_measure_start_entry.get(), "Measure Start Delay", minimum=0, units="ms")
+        measure_end_margin = validate_float(visual_measure_end_entry.get(), "Measure End Margin", minimum=0, units="ms")
+        readings_per_pulse = assembly_helpers.require_count(
+            validate_float(visual_readings_per_pulse_entry.get(), "Readings per Pulse"),
+            "Readings per Pulse")
+        sample_interval = validate_float(visual_sample_interval_entry.get(), "Sample Interval", minimum=1e-6, units="ms", hint="Must be greater than zero.")
 
         continuous_mode = visual_continuous_var.get() == 1
 
@@ -2108,21 +2198,7 @@ def run_visual_synapse_mode():
         if pulse_period < pulse_width:
             raise ValueError("Pulse Period must be >= Pulse Width")
 
-        if n_pulses <= 0:
-            raise ValueError("Number of pulses must be greater than zero")
-
-        measurement_window = pulse_width - measure_start_delay - measure_end_margin
-        if measurement_window <= 0 and not continuous_mode:
-            raise ValueError(
-                f"Invalid measurement window.\n"
-                f"Pulse width ({pulse_width}ms) must be > start delay ({measure_start_delay}ms) + end margin ({measure_end_margin}ms)"
-            )
-
         compliance_A = get_compliance_value()
-
-        # Safety check for high LED voltages
-        if not synapse_engine.safety_check(light_voltage, max_safe_voltage=2.5):
-            return
 
         # Collect parameters
         params = {
@@ -2136,20 +2212,33 @@ def run_visual_synapse_mode():
             "sample_interval_ms": sample_interval,
             "compliance_A": compliance_A,
             "nplc": validate_float(nplc_entry.get(), "NPLC", minimum=0.001, maximum=25, units="power line cycles", hint="The 2600-series ADC accepts 0.001-25 NPLC; 1 NPLC = 20 ms at 50 Hz."),
-                # H16: the documented line_freq_hz key, now actually supplied
-                # by the GUI instead of always falling back to 50 Hz.
-                "line_freq_hz": get_line_freq_hz(),
+            # H16: the documented line_freq_hz key, now actually supplied
+            # by the GUI instead of always falling back to 50 Hz.
+            "line_freq_hz": get_line_freq_hz(),
             "wire_modes": build_wire_modes(),
             "measure_avg_user": _read_samples_per_pulse(),
-            "wavelength_nm": validate_float(visual_wavelength_entry.get(), "Wavelength"),
-            "intensity_mW_cm2": validate_float(visual_intensity_entry.get(), "Light Intensity"),
+            "wavelength_nm": validate_float(visual_wavelength_entry.get(), "Wavelength", minimum=0, units="nm"),
+            "intensity_mW_cm2": validate_float(visual_intensity_entry.get(), "Light Intensity", minimum=0, units="mW/cm2"),
             "sample_id": visual_sample_id_entry.get().strip()
         }
+        led_check = {"stim_drive_type": "V", "stim_level": light_voltage, "read_voltage": 0.0}
+
+        def _window_ok(line_freq_hz):
+            # The ADC-fit test comes BEFORE the safety prompt: asking the user to
+            # confirm an LED level for a run that cannot execute is noise.
+            if not continuous_mode:
+                assembly_helpers.check_visual_window(
+                    pulse_width, measure_start_delay, measure_end_margin,
+                    params["nplc"], line_freq_hz)
 
         # Run measurement or simulation
         if simulate_var.get():
-            # Simulation mode
+            _window_ok(synapse_engine._line_freq_hz(params))
+            if not synapse_engine.safety_check(light_voltage, max_safe_voltage=2.5):
+                _declined("Simulation")
+                return
             results = synapse_engine.simulate_visual_synapse(params, continuous_mode=continuous_mode)
+            results.setdefault('execution_path', 'simulation')
             messagebox.showinfo("Simulation", "Visual synapse simulation completed!")
         else:
             # Hardware mode
@@ -2159,53 +2248,27 @@ def run_visual_synapse_mode():
             if not port:
                 raise ValueError("Port Address cannot be empty.")
 
+            # Refuse an invalid timeout instead of silently replacing it with
+            # max(user, 30 s), and before the instrument is opened.
+            timeout_s = _parse_timeout_s(max(30.0, pulse_period * n_pulses / 1000.0 * 1.5))
+
             # Open instrument
             instrument = synapse_engine.open_instrument(port, connection)
-
-            # Check instrument model
             try:
-                model = instrument.query("*IDN?")
-                print(f"✓ Connected to: {model}")
-
-                # Check for LUA support (required for visual mode)
                 if not synapse_engine.supports_lua_execution(instrument):
-                    instrument.close()
-                    messagebox.showerror(
-                        "Instrument Not Supported",
+                    raise ValueError(
                         "Visual synapse mode requires a LUA-capable instrument (2600 series).\n\n"
                         "Please use Keithley 2602B, 2612B, 2636A, or similar."
                     )
+                # Order: instrument limit, mains frequency (Auto is read from the
+                # instrument), ADC-vs-window, and only then the safety prompt.
+                check_instrument_limits(instrument, led_check, "Visual LED")
+                _window_ok(synapse_engine.resolve_line_freq(instrument, params))
+                if not check_synapse_safety(instrument, led_check, "Visual LED", max_safe_voltage=2.5):
+                    _declined("Measurement")
                     return
 
-                # Check voltage limits for instrument
-                max_voltage_instr = synapse_engine.get_max_voltage(instrument)
-                if abs(light_voltage) > max_voltage_instr:
-                    instrument.close()
-                    messagebox.showerror(
-                        "Voltage Limit Exceeded",
-                        f"ERROR: Instrument voltage limit exceeded.\n\n"
-                        f"Instrument: {model.strip()}\n"
-                        f"Maximum voltage: {max_voltage_instr}V\n"
-                        f"Requested LED voltage: {abs(light_voltage)}V\n\n"
-                        f"Please reduce LED voltage to ≤{max_voltage_instr}V."
-                    )
-                    return
-
-            except Exception as e:
-                print(f"Warning: Could not detect instrument model: {e}")
-
-            # Configure timeout
-            try:
-                user_timeout = validate_float(timeout_entry.get(), "Timeout Duration")
-                timeout_value = max(user_timeout * 1000, 30000)
-            except ValueError:
-                total_time = (params['pulse_period_ms'] * params['n_pulses']) / 1000.0
-                timeout_value = max(30000, total_time * 1000 * 1.5)
-
-            instrument.timeout = timeout_value
-
-            try:
-                # Run visual synapse measurement
+                instrument.timeout = timeout_s * 1000
                 results = synapse_engine.visual_synapse_sequence(
                     instrument,
                     stim_ch_str,
@@ -2213,10 +2276,9 @@ def run_visual_synapse_mode():
                     params,
                     continuous_mode=continuous_mode
                 )
-                messagebox.showinfo("Success", "Visual synapse measurement completed!")
-
             finally:
                 instrument.close()
+            _show_run_outcome(results, "Visual synapse measurement")
 
         # Plot results
         plot_visual_synapse_data(results)
@@ -2225,7 +2287,7 @@ def run_visual_synapse_mode():
         register_synapse_run(results)
 
     except Exception as e:
-        messagebox.showerror("Error", str(e))
+        messagebox.showerror("Error", _readable_error(e))
 
 
 def plot_visual_synapse_data(results):
@@ -2285,6 +2347,136 @@ def plot_visual_synapse_data(results):
     params_text.see("end")
 
 
+def plot_retention_data(results):
+    """Plots conductance decay (G vs elapsed time) from measure_retention."""
+    global ax, canvas
+
+    ax.clear()
+    if hasattr(ax, 'ax2') and ax.ax2 is not None:
+        ax.ax2.remove()
+        ax.ax2 = None
+
+    t = np.array(results["time_s"], dtype=float)
+    g = np.array(results["conductance_S"], dtype=float)
+    ax.plot(t, g * 1e6, 'o-', color='tab:orange', linewidth=2, markersize=4)
+    ax.set_xlabel("Time since start (s)", fontsize=11)
+    ax.set_ylabel("Conductance (µS)", fontsize=11)
+    ax.set_title("Retention - conductance decay", fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    canvas.draw()
+
+    params_text.insert("end", f"\n{'='*30}\n")
+    params_text.insert("end", "Retention Results\n")
+    params_text.insert("end", f"{'='*30}\n")
+    params_text.insert("end", f"Points: {len(t)}\n")
+    params_text.insert("end", f"Read Voltage: {results['params']['read_voltage']} V\n")
+    if len(g) >= 2 and np.isfinite(g[0]) and g[0] != 0 and np.isfinite(g[-1]):
+        params_text.insert("end", f"G first: {g[0]*1e6:.4g} µS   G last: {g[-1]*1e6:.4g} µS\n")
+        params_text.insert("end", f"Change: {(g[-1]/g[0] - 1)*100:+.2f} %\n")
+    params_text.insert("end", f"{'='*30}\n\n")
+    params_text.see("end")
+
+
+def run_retention_mode():
+    """Measures conductance decay after potentiation (synapse_engine.measure_retention).
+
+    The device should be potentiated first (Basic mode) and left powered: the
+    decay being measured starts when the stimulus ends. Readings are timed by
+    the host clock, which is the right tool for waits of seconds to hours.
+    """
+    global _measurement_in_progress
+    if _measurement_in_progress:
+        messagebox.showwarning(
+            "Measurement In Progress",
+            "A measurement is already running, so the Retention measurement was not "
+            "started. Starting a second one would open a second session to the "
+            "same instrument mid-sweep."
+        )
+        return
+
+    _measurement_in_progress = True
+    try:
+        try:
+            if simulate_var.get():
+                raise ValueError(
+                    "There is no retention simulator. Uncheck 'Simulate (No Hardware)' "
+                    "to measure a real device. Nothing was measured.")
+
+            read_ch_str = read_channel_var.get().lower()
+            read_voltage = validate_float(retention_read_voltage_entry.get(), "Read Voltage", units="V")
+            if read_voltage == 0:
+                raise ValueError(
+                    "Retention needs a non-zero read voltage: conductance G = I/V is "
+                    "undefined at 0 V, and a decay curve of NaN is not a measurement.")
+
+            times_raw = retention_times_entry.get().strip()
+            if times_raw:
+                try:
+                    sample_times = [float(x) for x in times_raw.replace(";", ",").split(",") if x.strip()]
+                except ValueError:
+                    raise ValueError(
+                        f"Sample times: {times_raw!r} is not a comma-separated list of "
+                        "numbers in seconds (for example 1, 10, 30, 100, 300).")
+                waits = assembly_helpers.retention_waits_from_times(sample_times)
+            else:
+                interval = validate_float(retention_interval_entry.get(), "Sampling interval", minimum=1e-3, units="s")
+                n_points = assembly_helpers.require_count(
+                    validate_float(retention_points_entry.get(), "# Points"), "# Points", minimum=2)
+                waits = [interval] * n_points
+
+            compliance_A = get_compliance_value()
+            if compliance_A <= 0:
+                raise ValueError("Compliance must be greater than zero")
+
+            params = {
+                "mode": "retention",
+                "read_voltage": read_voltage,
+                "retention_times_s": waits,
+                "compliance_A": compliance_A,
+                "nplc": validate_float(nplc_entry.get(), "NPLC", minimum=0.001, maximum=25, units="power line cycles", hint="The 2600-series ADC accepts 0.001-25 NPLC; 1 NPLC = 20 ms at 50 Hz."),
+                "line_freq_hz": get_line_freq_hz(),
+                "settle_ms": 5,
+                "wire_modes": build_wire_modes(),
+                "sample_id": retention_sample_id_entry.get().strip(),
+            }
+
+            port = port_entry.get().strip()
+            connection = connection_type.get()
+            if not port:
+                raise ValueError("Port Address cannot be empty.")
+            timeout_s = _parse_timeout_s(30.0)
+
+            total_s = float(sum(waits))
+            if total_s > 60 and not messagebox.askyesno(
+                    "Confirm Retention Measurement",
+                    f"{len(waits)} readings over about {total_s/60:.1f} min. The window "
+                    "will not respond until the run ends.\n\nContinue?"):
+                _declined("Retention measurement")
+                return
+
+            instrument = synapse_engine.open_instrument(port, connection)
+            try:
+                check_instrument_limits(
+                    instrument, {"stim_drive_type": "V", "stim_level": 0.0,
+                                 "read_voltage": read_voltage}, "Retention")
+                instrument.timeout = timeout_s * 1000
+                results = synapse_engine.measure_retention(instrument, read_ch_str, params)
+            finally:
+                instrument.close()
+            # Readings are paced by the host clock by design (waits of seconds
+            # to hours), so this is the execution path, not a fallback.
+            results.setdefault('execution_path', 'standard')
+            _show_run_outcome(results, "Retention measurement", host_timed_by_design=True)
+
+            plot_retention_data(results)
+            register_synapse_run(results)
+
+        except Exception as e:
+            messagebox.showerror("Error", _readable_error(e))
+    finally:
+        _measurement_in_progress = False
+
+
 def save_synapse_data():
     """
     Saves synapse measurement data to CSV file with metadata and metrics.
@@ -2327,6 +2519,7 @@ def save_synapse_data():
         elif "cycles" in last_data and "devices" not in last_data:
             # Single-device cycle data
             synapse_cycle.save_cycle_data(last_data, file_name)
+            _stamp_csv_header(file_name, last_data, baseline=_cycle_has_baseline(last_data))
             messagebox.showinfo(
                 "Save Successful",
                 f"Cycle data saved successfully to:\n{file_name}"
@@ -2334,6 +2527,7 @@ def save_synapse_data():
         elif "devices" in last_data:
             # Multi-device cycle data
             synapse_cycle.save_multi_device_data(last_data, file_name)
+            _stamp_csv_header(file_name, last_data, baseline=_cycle_has_baseline(last_data))
             messagebox.showinfo(
                 "Save Successful",
                 f"Multi-device data saved successfully to:\n{file_name}"
@@ -2341,11 +2535,19 @@ def save_synapse_data():
         elif "Jsc_A" in last_data:
             # Visual (self-powered) synapse data
             metrics = synapse_engine.save_visual_synapse_data(last_data, file_name)
+            # One Jsc value per pulse: there is no pre-stimulus baseline point.
+            _stamp_csv_header(file_name, last_data, baseline=False)
             messagebox.showinfo(
                 "Save Successful",
                 f"Visual synapse data saved successfully to:\n{file_name}\n\n"
                 f"Metrics calculated:\n" +
                 "\n".join(f"  • {k}: {v}" for k, v in list(metrics.items())[:3])
+            )
+        elif assembly_helpers.classify_run(last_data) == "retention":
+            save_retention_data(last_data, file_name)
+            messagebox.showinfo(
+                "Save Successful",
+                f"Retention data saved successfully to:\n{file_name}"
             )
         else:
             # Regular synapse pulse-read data
@@ -2357,9 +2559,10 @@ def save_synapse_data():
                 "\n".join(f"  • {k}: {v}" for k, v in list(metrics.items())[:3])
             )
         
-        # Clear stored data
-        synapse_data_storage.clear()
-        
+        # Saving does not consume the run. It used to clear ALL stored runs
+        # (not just the one saved) while the Runs panel went on listing them,
+        # with remove buttons that then did nothing; and an unsaved run
+        # destroyed this way could not be exported as a suite afterwards.
     except Exception as e:
         messagebox.showerror("Save Error", str(e))
 
@@ -2367,191 +2570,141 @@ def save_synapse_data():
 def export_characterization_suite():
     """
     Export complete characterization suite for model fitting and network simulation.
-    
-    This assembles all measurements from synapse_data_storage into a standardized
-    JSON file that can be used with fitting.py and network.py.
-    
+
+    This assembles measurements from synapse_data_storage into a standardized
+    JSON file that can be used with fitting.py and network.py. Every dataset
+    carries the stimulus metadata of the run it came from (assembly_helpers
+    derives it per run), so a sweep measured at several intensities keeps each.
+
     Supports:
-    - Wavelength sweep measurements (for wavelength_response)
-    - LTP measurements (for nonlinearity extraction)
+    - Wavelength sweep (auto-detected from optical pulse-read runs)
+    - LTP / LTD measurements (nonlinearity alpha / beta)
     - Potentiation-depression cycles (for dynamic_range)
     - Retention measurements (for decay_tau)
+    - STDP window and SRDP response
     """
     global synapse_data_storage
-    
+
     if not synapse_data_storage:
         messagebox.showerror("No Data", "No characterization data to export!\n\nPlease run measurements first.")
         return
-    
-    # Import assembly helpers
-    try:
-        import assembly_helpers
-    except ImportError:
-        messagebox.showerror(
-            "Module Not Found", 
-            "assembly_helpers.py not found!\n\n"
-            "Please ensure assembly_helpers.py is in the same directory as this script."
-        )
-        return
-    
+
     try:
         # Create a dialog to help user organize their measurements
         from tkinter import Toplevel, Label, Button, Listbox, SINGLE, END
-        
-        # Create selection dialog
+
         dialog = Toplevel(root)
         dialog.title("Export Characterization Suite")
-        dialog.geometry("600x500")
-        
-        Label(dialog, text="Select measurements to include:", font=("Arial", 12, "bold")).pack(pady=10)
-        
-        # Show available measurements
-        Label(dialog, text=f"Available measurements: {len(synapse_data_storage)}", font=("Arial", 10)).pack()
-        
-        listbox = Listbox(dialog, height=15, width=80, selectmode=SINGLE)
-        listbox.pack(padx=20, pady=10, fill="both", expand=True)
-        
-        # Populate listbox with measurement descriptions
-        for i, data in enumerate(synapse_data_storage):
-            if "cycles" in data:
-                desc = f"[{i}] Pot-Dep Cycles (n={len(data['cycles'])} cycles)"
-            elif "frequencies_hz" in data:
-                desc = f"[{i}] SRDP ({len(data['frequencies_hz'])} freq points)"
-            elif "delta_t_ms" in data:
-                desc = f"[{i}] STDP ({len(data['delta_t_ms'])} timing points)"
-            elif "conductance_S" in data:
-                n_pulses = len(data['conductance_S'])
-                if n_pulses > 30:
-                    desc = f"[{i}] LTP/LTD ({n_pulses} pulses)"
-                else:
-                    desc = f"[{i}] Pulse-Read ({n_pulses} pulses)"
-            elif "time_s" in data:
-                desc = f"[{i}] Retention ({len(data['time_s'])} time points)"
-            else:
-                desc = f"[{i}] Unknown measurement type"
-            
-            listbox.insert(END, desc)
-        
-        # Variables to store selections.
-        #
-        # LTD, STDP and SRDP had no entries here at all, so no dataset with
-        # experiment_type 'depression', 'stdp' or 'srdp' could ever reach the
-        # fitter from hardware: beta was unfittable and the STDP window and
-        # SRDP sigmoid always came from defaults, however much data had been
-        # measured.
-        ltp_idx = None
-        ltd_idx = None
-        cycle_idx = None
-        retention_idx = None
-        stdp_idx = None
-        srdp_idx = None
+        dialog.geometry("720x560")
 
-        def _mark(kind, setter, note):
+        Label(dialog, text="Select measurements to include:", font=("Arial", 12, "bold")).pack(pady=10)
+        Label(dialog, text=f"Available measurements: {len(synapse_data_storage)}", font=("Arial", 10)).pack()
+
+        listbox = Listbox(dialog, height=15, width=100, selectmode=SINGLE)
+        listbox.pack(padx=20, pady=10, fill="both", expand=True)
+
+        # Each run is described by what it IS (mode, branch, conditions), never
+        # by its length: a 30-point threshold used to decide "LTP/LTD" versus
+        # "Pulse-Read", and a Visual run with a time axis was labelled Retention.
+        for i, data in enumerate(synapse_data_storage):
+            listbox.insert(END, f"[{i}] {assembly_helpers.describe_run(data)}")
+
+        # Slot -> index of the stored run assigned to it. LTD, STDP and SRDP
+        # slots exist because without them no dataset with experiment_type
+        # 'depression', 'stdp' or 'srdp' could reach the fitter from hardware.
+        marks = {}
+        marks_label = Label(dialog, text="Marked: (none)", font=("Arial", 9), justify="left")
+        marks_label.pack()
+
+        def _refresh_marks():
+            marks_label.config(text="Marked: " + (
+                ", ".join(f"{r.upper()}=[{i}]" for r, i in marks.items()) or "(none)"))
+
+        def _mark(role, kind, note):
             selection = listbox.curselection()
             if not selection:
                 messagebox.showwarning(
                     "Nothing Selected",
                     f"Select a measurement in the list first, then click "
-                    f"'Mark as {kind}'."
-                )
+                    f"'Mark as {kind}'.")
                 return
             idx = selection[0]
-            setter(idx)
+            run = synapse_data_storage[idx]
+            reason = assembly_helpers.check_role(run, role)
+            if reason:
+                messagebox.showerror("Cannot Assign", reason)
+                return
+            # LTP/LTD is the user's call, but a run that moved the other way is
+            # almost certainly the wrong pick and would corrupt alpha / beta.
+            branch = assembly_helpers.run_branch(run)
+            expected = {'ltp': 'potentiation', 'ltd': 'depression'}.get(role)
+            if expected and branch != expected and not messagebox.askyesno(
+                    "Branch Mismatch",
+                    f"Measurement {idx} shows net {branch or 'no measurable change'}, "
+                    f"but is being marked as {kind}. Mark it anyway?"):
+                return
+            marks[role] = idx
+            _refresh_marks()
             messagebox.showinfo(f"{kind} Selected", f"Measurement {idx} marked {note}")
 
         def mark_as_ltp():
-            def _set(i):
-                nonlocal ltp_idx
-                ltp_idx = i
-            _mark("LTP", _set, "as LTP for nonlinearity extraction (alpha)")
+            _mark('ltp', "LTP", "as LTP for nonlinearity extraction (alpha)")
 
         def mark_as_ltd():
-            def _set(i):
-                nonlocal ltd_idx
-                ltd_idx = i
-            _mark("LTD", _set, "as LTD for depression nonlinearity (beta)")
+            _mark('ltd', "LTD", "as LTD for depression nonlinearity (beta)")
 
         def mark_as_cycles():
-            def _set(i):
-                nonlocal cycle_idx
-                cycle_idx = i
-            _mark("Cycles", _set, "for dynamic range extraction")
+            _mark('cycles', "Cycles", "for dynamic range extraction")
 
         def mark_as_retention():
-            def _set(i):
-                nonlocal retention_idx
-                retention_idx = i
-            _mark("Retention", _set, "for decay tau extraction")
+            _mark('retention', "Retention", "for decay tau extraction")
 
         def mark_as_stdp():
-            def _set(i):
-                nonlocal stdp_idx
-                stdp_idx = i
-            _mark("STDP", _set, "as the STDP timing window")
+            _mark('stdp', "STDP", "as the STDP timing window")
 
         def mark_as_srdp():
-            def _set(i):
-                nonlocal srdp_idx
-                srdp_idx = i
-            _mark("SRDP", _set, "as the SRDP frequency response")
-        
-        # === AUTO-DETECT WAVELENGTH SWEEP ===
-        def auto_detect_wavelength_sweep():
-            """Auto-detect wavelength sweep measurements from metadata."""
-            wavelength_dict = {}
-            for idx, data in enumerate(synapse_data_storage):
-                if 'metadata' in data and 'wavelength_nm' in data['metadata']:
-                    wl = data['metadata']['wavelength_nm']
-                    # Only add if we don't already have this wavelength
-                    if wl not in wavelength_dict:
-                        wavelength_dict[wl] = data
-            
-            # Convert to lists if we found a wavelength sweep (3+ wavelengths).
-            #
-            # H4: the results and the wavelengths MUST be taken from the same
-            # ordering. This used to return `list(wavelength_dict.values())` —
-            # insertion, i.e. run, order — alongside `sorted(keys)`, and
-            # assembly_helpers zips the two together. Measuring 550, then 450,
-            # then 650 nm therefore tagged the 550 nm trace as 450 nm and vice
-            # versa, and the multi-Gaussian fit was fitted to permuted data
-            # with no error raised anywhere. Sorting the pairs jointly makes
-            # the association independent of measurement order.
-            if len(wavelength_dict) >= 3:
-                ordered = sorted(wavelength_dict.items(), key=lambda kv: kv[0])
-                wavelengths = [wl for wl, _ in ordered]
-                wavelength_results = [res for _, res in ordered]
-                print(f"Auto-detected wavelength sweep: {wavelengths} nm")
-                return wavelength_results, wavelengths
-            else:
-                return None, None
-        # === END AUTO-DETECT ===
-        
+            _mark('srdp', "SRDP", "as the SRDP frequency response")
+
         def proceed_export():
-            dialog.destroy()
-            
-            # Collect metadata from the most recent cycle measurement if available
+            # H4: wavelengths are paired with their own results (sorted jointly),
+            # and only optical pulse-read runs qualify; an electrical run's
+            # "manual light" wavelength used to put it in the sweep.
+            sweep_results, sweep_wavelengths, sweep_skipped = \
+                assembly_helpers.detect_wavelength_sweep(synapse_data_storage)
+
+            if not marks and sweep_results is None:
+                messagebox.showwarning(
+                    "Nothing To Export",
+                    "Nothing is marked and no wavelength sweep (3+ optical "
+                    "pulse-read runs at distinct wavelengths) was found.\n\n"
+                    "Select a run and use a 'Mark as ...' button first.")
+                return
+
+            exported = [synapse_data_storage[i] for i in marks.values()] + (sweep_results or [])
+
+            # The sample comes from the runs being exported, not from whichever
+            # run happens to be stored first.
+            sample_ids = sorted({sid for sid in map(assembly_helpers.run_sample_id, exported) if sid})
             metadata = {
                 'sample_id': 'unknown',
                 'operator': 'User',
                 'export_date': time.strftime("%Y-%m-%d %H:%M:%S"),
                 'notes': 'Exported from Keithley GUI'
             }
-            
-            # Try to get sample_id from any measurement with metadata
-            for data in synapse_data_storage:
-                if 'metadata' in data and 'sample_id' in data['metadata']:
-                    metadata['sample_id'] = data['metadata']['sample_id']
-                    break
-                elif 'params' in data and 'sample_id' in data['params']:
-                    metadata['sample_id'] = data['params']['sample_id']
-                    break
-            
-            # F7: only fall back to a GUI entry when the measurements
-            # themselves carried no sample ID. This block used to run
-            # unconditionally and overwrite the detected ID with whatever the
-            # Cycle tab's widget happened to hold, so a Basic-mode export was
-            # always labelled with the Cycle tab's sample name.
-            if metadata['sample_id'] == 'unknown':
+            if len(sample_ids) == 1:
+                metadata['sample_id'] = sample_ids[0]
+            elif len(sample_ids) > 1:
+                if not messagebox.askyesno(
+                        "Different Samples",
+                        "The selected runs were measured on different samples:\n  "
+                        + "\n  ".join(sample_ids)
+                        + "\n\nA suite describes one device. Export them together anyway?"):
+                    return
+                metadata['sample_id'] = 'mixed'
+                metadata['sample_ids'] = sample_ids
+            else:
+                # F7: only fall back to a GUI entry when the measurements
+                # themselves carried no sample ID, and say where it came from.
                 for widget_name, widget in (('cycle', globals().get('cycle_sample_id_entry')),
                                             ('basic', globals().get('sample_id_entry'))):
                     if widget is None:
@@ -2564,104 +2717,46 @@ def export_characterization_suite():
                         metadata['sample_id'] = candidate
                         metadata['sample_id_source'] = f'{widget_name} tab entry'
                         break
-            
-            # Auto-detect wavelength sweep
-            wavelength_results, wavelengths = auto_detect_wavelength_sweep()
-            
-            # Extract stimulus parameters from the first available measurement.
-            #
-            # F6: this block wrote wrong values under right-sounding keys.
-            #   - 'intensity' received params['stim_level'], the stimulus
-            #     VOLTAGE in volts, into the field the fitter reads as optical
-            #     intensity in mW/cm² — while the correct intensity_mW_cm2 sat
-            #     unused in the same dict.
-            #   - 'pulse_width_ms' and 'frequency_Hz' looked up 'pulse_width_ms'
-            #     and 'pulse_period_ms', which pulse-read params do not have
-            #     (they are 'stim_width_ms' and 'stim_period_ms'), so both
-            #     always fell to their hardcoded 100 and 10.
-            #   - 'stimulus_type' received params['mode'] — 'electrical' or
-            #     'visual' — rather than a stimulus kind.
-            #   - 'wavelength_pot' defaulted to a hardcoded 550 nm.
-            # Every key is now read from the name the engine actually uses, and
-            # nothing is invented: a value that was not measured is omitted, so
-            # the fitter can tell it is absent instead of fitting a fabricated
-            # number.
-            stimulus_params = {}
-            for data in synapse_data_storage:
-                p = data.get('params')
-                if not p:
-                    continue
 
-                mode = p.get('mode', '')
-                stimulus_params = {
-                    'stimulus_type': 'light' if mode == 'visual' else 'electrical',
-                    'measurement_mode': mode,
-                }
-
-                # Canonical key names. These used to be 'intensity' (unit-less)
-                # and 'wavelength_pot' (branch pre-decided) — neither of which
-                # any consumer read: assembly_helpers tests for
-                # 'wavelength_nm', and fitting.py reads
-                # 'light_intensity_mW_cm2'. A full spectral sweep therefore
-                # exported with no wavelength and no intensity that the fitter
-                # could see, and the wavelength-response extraction silently
-                # had nothing to work with.
-                if p.get('intensity_mW_cm2') is not None:
-                    stimulus_params['light_intensity_mW_cm2'] = p['intensity_mW_cm2']
-                if p.get('wavelength_nm') is not None:
-                    stimulus_params['wavelength_nm'] = p['wavelength_nm']
-                if p.get('stim_width_ms') is not None:
-                    stimulus_params['pulse_width_ms'] = p['stim_width_ms']
-                if p.get('stim_period_ms'):
-                    stimulus_params['frequency_Hz'] = 1000.0 / p['stim_period_ms']
-                if p.get('n_pulses') is not None:
-                    stimulus_params['n_pulses'] = p['n_pulses']
-                if p.get('stim_level') is not None:
-                    # Recorded under its own name, in its own units — not as
-                    # "intensity".
-                    stimulus_params['stim_level'] = p['stim_level']
-                    stimulus_params['stim_drive_type'] = p.get('stim_drive_type', 'V')
-                break
-            
-            # Build characterization suite
             try:
-                def _pick(idx):
-                    return synapse_data_storage[idx] if idx is not None else None
+                def _pick(role):
+                    return synapse_data_storage[marks[role]] if role in marks else None
 
                 suite = assembly_helpers.build_characterization_suite(
-                    wavelength_results=wavelength_results,
-                    wavelengths=wavelengths,
-                    ltp_result=_pick(ltp_idx),
-                    ltd_result=_pick(ltd_idx),
-                    cycle_results=_pick(cycle_idx),
-                    retention_result=_pick(retention_idx),
-                    stdp_result=_pick(stdp_idx),
-                    srdp_result=_pick(srdp_idx),
-                    stimulus_params=stimulus_params,
+                    wavelength_results=sweep_results,
+                    wavelengths=sweep_wavelengths,
+                    ltp_result=_pick('ltp'),
+                    ltd_result=_pick('ltd'),
+                    cycle_results=_pick('cycles'),
+                    retention_result=_pick('retention'),
+                    stdp_result=_pick('stdp'),
+                    srdp_result=_pick('srdp'),
                     metadata=metadata
                 )
 
-                # Validate suite
-                assembly_helpers.validate_suite(suite)
+                report = assembly_helpers.validate_suite(suite)
+                if not report['valid']:
+                    if not messagebox.askyesno(
+                            "Suite Is INVALID",
+                            "This suite is flagged INVALID and cannot determine a "
+                            "complete device model:\n- "
+                            + "\n- ".join(report['warnings'] or report['missing_critical'])
+                            + "\n\nExport it anyway?"):
+                        return
 
                 # Determine what was included
                 included = []
-                if wavelength_results:
-                    included.append("wavelength_response")
-                if ltp_idx is not None:
-                    included.append("nonlinearity (alpha)")
-                if ltd_idx is not None:
-                    included.append("depression nonlinearity (beta)")
-                if cycle_idx is not None:
-                    included.append("dynamic_range")
-                if retention_idx is not None:
-                    included.append("retention")
-                if stdp_idx is not None:
-                    included.append("STDP window")
-                if srdp_idx is not None:
-                    included.append("SRDP response")
-                
-                # Save dialog
+                if sweep_results:
+                    included.append("wavelength_response ("
+                                    + ", ".join(
+                                        f"{wl:g} nm @ "
+                                        f"{assembly_helpers.run_params(r).get('intensity_mW_cm2', '?')} mW/cm2"
+                                        for wl, r in zip(sweep_wavelengths, sweep_results))
+                                    + ")")
+                included += [{'ltp': "nonlinearity (alpha)", 'ltd': "depression nonlinearity (beta)",
+                              'cycles': "dynamic_range", 'retention': "retention",
+                              'stdp': "STDP window", 'srdp': "SRDP response"}[r] for r in marks]
+
                 default_name = f"{metadata['sample_id']}_characterization.json"
                 filename = asksaveasfilename(
                     defaultextension=".json",
@@ -2669,27 +2764,35 @@ def export_characterization_suite():
                     initialfile=default_name,
                     title="Save Characterization Suite"
                 )
-                
-                if filename:
-                    assembly_helpers.save_characterization_suite(suite, filename)
-                    messagebox.showinfo(
-                        "Export Successful!", 
-                        f"Characterization suite exported!\n\n"
-                        f"File: {os.path.basename(filename)}\n"
-                        f"Sample: {metadata['sample_id']}\n"
-                        f"Datasets included: {', '.join(included)}\n\n"
-                        f"This file can now be used with:\n"
-                        f"  • fitting.py (extract_synapse_model)\n"
-                        f"  • network.py (load into simulations)"
-                    )
-            
+                if not filename:
+                    return
+
+                assembly_helpers.save_characterization_suite(suite, filename)
+                dialog.destroy()
+                notes = []
+                if sweep_skipped:
+                    notes.append(f"{sweep_skipped} further run(s) at an already-included "
+                                 "wavelength were not exported.")
+                notes += [f"Recommendation: {r}" for r in report['recommendations']]
+                messagebox.showinfo(
+                    "Export Successful!" if report['valid'] else "Exported (suite flagged INVALID)",
+                    f"Characterization suite exported!\n\n"
+                    f"File: {os.path.basename(filename)}\n"
+                    f"Sample: {metadata['sample_id']}\n"
+                    f"Datasets included: {'; '.join(included)}\n\n"
+                    + ("\n".join(notes) + "\n\n" if notes else "")
+                    + f"This file can now be used with:\n"
+                    f"  • fitting.py (extract_synapse_model)\n"
+                    f"  • network.py (load into simulations)"
+                )
+
             except Exception as e:
                 messagebox.showerror("Export Error", f"Failed to export suite:\n\n{str(e)}")
-        
+
         # Add buttons
         button_frame = ctk.CTkFrame(dialog)
         button_frame.pack(pady=10)
-        
+
         Button(button_frame, text="Mark as LTP (α)", command=mark_as_ltp, bg="#2196F3", fg="white", width=18).pack(side="left", padx=3)
         Button(button_frame, text="Mark as LTD (β)", command=mark_as_ltd, bg="#3F51B5", fg="white", width=18).pack(side="left", padx=3)
         Button(button_frame, text="Mark as Cycles (G_min/G_max)", command=mark_as_cycles, bg="#4CAF50", fg="white", width=24).pack(side="left", padx=3)
@@ -2700,13 +2803,77 @@ def export_characterization_suite():
         Button(button_frame2, text="Mark as STDP", command=mark_as_stdp, bg="#9C27B0", fg="white", width=18).pack(side="left", padx=3)
         Button(button_frame2, text="Mark as SRDP", command=mark_as_srdp, bg="#00897B", fg="white", width=18).pack(side="left", padx=3)
 
-
         Button(dialog, text="Export Suite", command=proceed_export, bg="#4CAF50", fg="white", font=("Arial", 12, "bold"), width=20).pack(pady=20)
         Button(dialog, text="Cancel", command=dialog.destroy, bg="#F44336", fg="white", width=20).pack()
-        
+
     except Exception as e:
         messagebox.showerror("Export Error", f"Error during export:\n\n{str(e)}")
-        
+
+
+def _path_header_line(results, baseline=False):
+    """CSV header line recording how the run was executed.
+
+    `pulse_index_0=pre_stimulus_baseline` is claimed only when the caller has
+    verified that index 0 of this data really is the pre-stimulus read.
+    """
+    paths, _, _ = _execution_summary(results)
+    line = f"# execution_path={','.join(paths) if paths else 'not_reported'}"
+    if baseline:
+        line += " # pulse_index_0=pre_stimulus_baseline"
+    return line
+
+
+def _stamp_csv_header(filename, results, baseline=False):
+    """Prepend the execution-path line to a CSV written by another module.
+
+    Skipped if the file already carries one, so a saver that writes its own
+    never gets a second, possibly contradictory, line.
+    """
+    with open(filename, encoding="utf-8", newline="") as f:
+        text = f.read()
+    if "# execution_path=" in text[:4096]:
+        return
+    eol = "\r\n" if "\r\n" in text[:4096] else "\n"
+    with open(filename, "w", encoding="utf-8", newline="") as f:
+        f.write(_path_header_line(results, baseline) + eol + text)
+
+
+def _cycle_has_baseline(results):
+    """True only if every cycle phase's index 0 is the pre-stimulus baseline.
+
+    The count must be n_pulses + 1 (a baseline plus one read per pulse), checked
+    per phase against that train's own config.
+    """
+    pairs = []
+    for run in (results.get('devices') or [results]):
+        for cycle in run.get('cycles', []):
+            for phase, key in (('potentiation', 'pot_params'), ('depression', 'dep_params')):
+                data = cycle.get(phase)
+                if data:
+                    pairs.append((data, (run.get(key) or {}).get('n_pulses')))
+    if not pairs:
+        return False
+    for data, n in pairs:
+        pn = data.get('pulse_number')
+        if n is None or not pn or pn[0] != 0 or len(pn) != n + 1:
+            return False
+    return True
+
+
+def save_retention_data(results, filename):
+    """Saves a retention measurement (conductance vs elapsed time) to CSV."""
+    params = results.get("params", {})
+    lines = [
+        "# Retention Characterization",
+        "# mode=retention",
+        _path_header_line(results),
+        "# " + " # ".join(f"{k}={v}" for k, v in params.items() if not isinstance(v, dict)),
+        "time_s,I_A,conductance_S",
+    ]
+    for t, i, g in zip(results["time_s"], results["I_A"], results["conductance_S"]):
+        lines.append(f"{t:.4f},{i:.6e},{g:.6e}")
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 
 def save_srdp_data(results, filename):
@@ -2723,6 +2890,7 @@ def save_srdp_data(results, filename):
     params = results["base_params"]
     metadata_line = "# SRDP Characterization # " + " # ".join(f"{k}={v}" for k, v in params.items())
     csv_content.append(metadata_line)
+    csv_content.append(_path_header_line(results))
     
     # Column headers
     csv_content.append("frequency_Hz,delta_G_S,delta_G_percent,G_initial_S,G_final_S")
@@ -2757,6 +2925,7 @@ def save_stdp_data(results, filename):
     params = results["base_params"]
     metadata_line = "# STDP Characterization # " + " # ".join(f"{k}={v}" for k, v in params.items())
     csv_content.append(metadata_line)
+    csv_content.append(_path_header_line(results))
     
     # Column headers
     csv_content.append("delta_t_ms,delta_G_S,delta_G_percent,G_initial_S,G_final_S")
@@ -3002,7 +3171,19 @@ _run_cards = []  # list of {'card': CTkFrame, 'results': dict}
 
 
 def _summarize_run(results):
+    """(title, subtitle) for the card; the subtitle ends with the execution path."""
+    title, subtitle = _summarize_run_body(results)
+    paths, _, _ = _execution_summary(results)
+    return title, f"{subtitle}  ·  path: {', '.join(paths) if paths else 'not reported'}"
+
+
+def _summarize_run_body(results):
     """Inspect a results dict and return (title, subtitle) for the card."""
+    # Retention — a time series from measure_retention, not a pulse train
+    if isinstance(results, dict) and assembly_helpers.classify_run(results) == 'retention':
+        p = results.get('params', {})
+        return ("Retention",
+                f"{len(results.get('time_s', []))} points  ·  {p.get('read_voltage', '?')} V read")
     # SRDP — has 'frequencies_hz' array
     if isinstance(results, dict) and 'frequencies_hz' in results:
         n = len(results.get('frequencies_hz', []))
@@ -3461,7 +3642,7 @@ synapse_frame = ctk.CTkFrame(left_panel)
 ctk.CTkLabel(synapse_frame, text="SYNAPSE MODE", font=("Arial", 12, "bold")).pack(pady=(5, 10))
 
 ctk.CTkLabel(synapse_frame, text="Synapse Sub-mode:").pack(anchor="w", padx=10)
-synapse_submode = ctk.CTkComboBox(synapse_frame, values=["Basic", "Visual (Self-Powered)", "SRDP", "STDP", "Cycle", "Multi-Device"],
+synapse_submode = ctk.CTkComboBox(synapse_frame, values=["Basic", "Visual (Self-Powered)", "SRDP", "STDP", "Cycle", "Multi-Device", "Retention"],
                                    command=lambda x: update_synapse_submode())
 synapse_submode.pack(fill="x", padx=10, pady=5)
 synapse_submode.set("Basic")
@@ -3739,7 +3920,7 @@ stdp_dt_end_entry.insert(0, "50")
 ctk.CTkLabel(synapse_stdp_frame, text="# Δt Points:").pack(anchor="w", padx=10)
 stdp_dt_points_entry = ctk.CTkEntry(synapse_stdp_frame)
 stdp_dt_points_entry.pack(fill="x", padx=10, pady=5)
-stdp_dt_points_entry.insert(0, "15")
+stdp_dt_points_entry.insert(0, "10")  # even: no point at dt=0; step 11.1 ms > pulse width
 
 ctk.CTkLabel(synapse_stdp_frame, text="# Spike Pairs:").pack(anchor="w", padx=10)
 stdp_n_pairs_entry = ctk.CTkEntry(synapse_stdp_frame)
@@ -3759,7 +3940,7 @@ stdp_post_level_entry.insert(0, "1.0")
 ctk.CTkLabel(synapse_stdp_frame, text="Pulse Width (ms):").pack(anchor="w", padx=10)
 stdp_pulse_width_entry = ctk.CTkEntry(synapse_stdp_frame)
 stdp_pulse_width_entry.pack(fill="x", padx=10, pady=5)
-stdp_pulse_width_entry.insert(0, "10")
+stdp_pulse_width_entry.insert(0, "5")  # <= smallest |dt| of the default sweep (5.6 ms)
 
 ctk.CTkLabel(synapse_stdp_frame, text="Pair Period (ms):").pack(anchor="w", padx=10)
 stdp_pair_period_entry = ctk.CTkEntry(synapse_stdp_frame)
@@ -4095,12 +4276,12 @@ visual_light_voltage_entry.insert(0, "3.0")
 ctk.CTkLabel(synapse_visual_frame, text="Light Pulse Width (ms):").pack(anchor="w", padx=10)
 visual_pulse_width_entry = ctk.CTkEntry(synapse_visual_frame)
 visual_pulse_width_entry.pack(fill="x", padx=10, pady=5)
-visual_pulse_width_entry.insert(0, "10")
+visual_pulse_width_entry.insert(0, "50")  # window 48 ms >= one NPLC=1 integration (20 ms at 50 Hz)
 
 ctk.CTkLabel(synapse_visual_frame, text="Light Pulse Period (ms):").pack(anchor="w", padx=10)
 visual_pulse_period_entry = ctk.CTkEntry(synapse_visual_frame)
 visual_pulse_period_entry.pack(fill="x", padx=10, pady=5)
-visual_pulse_period_entry.insert(0, "100")
+visual_pulse_period_entry.insert(0, "200")
 
 ctk.CTkLabel(synapse_visual_frame, text="# Light Pulses:").pack(anchor="w", padx=10)
 visual_n_pulses_entry = ctk.CTkEntry(synapse_visual_frame)
@@ -4125,7 +4306,7 @@ visual_measure_end_entry.insert(0, "1")
 ctk.CTkLabel(synapse_visual_frame, text="Readings per Pulse (hw avg):").pack(anchor="w", padx=10)
 visual_readings_per_pulse_entry = ctk.CTkEntry(synapse_visual_frame)
 visual_readings_per_pulse_entry.pack(fill="x", padx=10, pady=5)
-visual_readings_per_pulse_entry.insert(0, "5")
+visual_readings_per_pulse_entry.insert(0, "2")  # floor(48 ms / 20 ms): the most that fit
 
 ctk.CTkLabel(synapse_visual_frame, text="─ Continuous Mode (Optional) ─", font=("Arial", 10, "bold")).pack(pady=(10, 5))
 
@@ -4163,6 +4344,50 @@ run_visual_button.pack(fill="x", pady=5)
 
 save_visual_button = ctk.CTkButton(synapse_visual_button_frame, text="Save Data", command=save_synapse_data, fg_color="#1565C0", hover_color="#0D47A1")
 save_visual_button.pack(fill="x", pady=5)
+
+# --- RETENTION SUBMODE ---
+synapse_retention_frame = ctk.CTkFrame(synapse_frame)
+
+ctk.CTkLabel(synapse_retention_frame, text="─ Retention (Decay) ─", font=("Arial", 10, "bold")).pack(pady=(10, 5))
+ctk.CTkLabel(synapse_retention_frame,
+             text="Reads the Read Channel's conductance at intervals\nafter potentiation (run Basic first, leave the device\npowered). Compliance and NPLC are the global fields.",
+             font=("Arial", 9, "italic"), justify="left").pack(pady=5, padx=10, anchor="w")
+
+ctk.CTkLabel(synapse_retention_frame, text="Read Voltage (V):").pack(anchor="w", padx=10)
+retention_read_voltage_entry = ctk.CTkEntry(synapse_retention_frame)
+retention_read_voltage_entry.pack(fill="x", padx=10, pady=5)
+retention_read_voltage_entry.insert(0, "0.1")
+
+ctk.CTkLabel(synapse_retention_frame, text="Sample times (s since start, comma list; blank = interval):").pack(anchor="w", padx=10)
+retention_times_entry = ctk.CTkEntry(synapse_retention_frame)
+retention_times_entry.pack(fill="x", padx=10, pady=5)
+
+ctk.CTkLabel(synapse_retention_frame, text="Interval between readings (s):").pack(anchor="w", padx=10)
+retention_interval_entry = ctk.CTkEntry(synapse_retention_frame)
+retention_interval_entry.pack(fill="x", padx=10, pady=5)
+retention_interval_entry.insert(0, "10")
+
+ctk.CTkLabel(synapse_retention_frame, text="# Points:").pack(anchor="w", padx=10)
+retention_points_entry = ctk.CTkEntry(synapse_retention_frame)
+retention_points_entry.pack(fill="x", padx=10, pady=5)
+retention_points_entry.insert(0, "10")
+
+ctk.CTkLabel(synapse_retention_frame, text="Sample ID:").pack(anchor="w", padx=10)
+retention_sample_id_entry = ctk.CTkEntry(synapse_retention_frame)
+retention_sample_id_entry.pack(fill="x", padx=10, pady=5)
+retention_sample_id_entry.insert(0, "Sample_001")
+
+synapse_retention_button_frame = ctk.CTkFrame(synapse_retention_frame)
+synapse_retention_button_frame.pack(fill="x", padx=10, pady=10)
+
+run_retention_button = ctk.CTkButton(synapse_retention_button_frame, text="Run Retention", command=run_retention_mode, fg_color="#EF6C00", hover_color="#BF360C")
+run_retention_button.pack(fill="x", pady=5)
+
+save_retention_button = ctk.CTkButton(synapse_retention_button_frame, text="Save Data", command=save_synapse_data, fg_color="#1565C0", hover_color="#0D47A1")
+save_retention_button.pack(fill="x", pady=5)
+
+export_suite_retention_button = ctk.CTkButton(synapse_retention_button_frame, text="Export Characterization Suite", command=export_characterization_suite, fg_color="#2E7D32", hover_color="#1B5E20")
+export_suite_retention_button.pack(fill="x", pady=5)
 
 # ==============================================================================
 # GRAPH SETUP
@@ -4457,9 +4682,14 @@ def update_synapse_submode():
     synapse_cycle_frame.pack_forget()
     synapse_multidevice_frame.pack_forget()
     synapse_visual_frame.pack_forget()
+    synapse_retention_frame.pack_forget()
 
     # Show selected submode frame
-    if submode == "Visual (Self-Powered)":
+    if submode == "Retention":
+        # Self-contained: own read voltage and schedule; only the Read Channel
+        # and the global compliance / NPLC / mains fields are shared.
+        synapse_retention_frame.pack(fill="both", expand=True, pady=5)
+    elif submode == "Visual (Self-Powered)":
         # Visual mode has its own self-contained parameters
         synapse_visual_frame.pack(fill="both", expand=True, pady=5)
     elif submode in ("Cycle", "Multi-Device"):

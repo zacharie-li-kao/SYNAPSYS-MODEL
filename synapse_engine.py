@@ -227,6 +227,140 @@ def _emit_measurement_state(channel, measure_avg):
     return lines
 
 
+# Current-measurement settling time per fixed current range: "delays are
+# enforced to account for approximately 6 time constants of a given range"
+# (2600A Reference Manual 2600AS-901-01 Rev. D, Table 4-4 "Current Measure
+# Settling Time"; the 2600B manual has no table and says only that the default
+# measurement delay "varies by model"). These are the values the instrument's
+# own DELAY_AUTO inserts before every measure.i() on the 2634B/2635B/2636B and
+# 2635A/2636A, where measure.delay defaults to AUTO.
+CURRENT_RANGE_SETTLING_S = (
+    (100e-12, 0.360), (1e-9, 0.360), (10e-9, 0.090), (100e-9, 0.015),
+    (1e-6, 2.5e-3), (10e-6, 5e-4), (100e-6, 1.5e-4), (1e-3, 1e-4),
+    (10e-3, 8e-5), (100e-3, 8e-5), (1.0, 1.2e-4), (1.5, 1.2e-4), (3.0, 1.2e-4),
+    (10.0, 1.2e-4),
+)
+
+
+def range_settling_s(range_A):
+    """Settling time (s) of a fixed current-measurement range, from the table above."""
+    for r, t in CURRENT_RANGE_SETTLING_S:
+        if range_A <= r * (1 + 1e-9):
+            return t
+    raise ValueError(f"current range {range_A} A is beyond the 2600-series ranges")
+
+
+def check_read_settle(read_settle_s, range_A):
+    """Settling verdict for a read: None when settled, else a warning string.
+
+    measure.delay is set OFF by every script (see _emit_read_adc_setup), so the
+    script's own read_settle is the ONLY settling a read gets. Shorter than the
+    range's settling time means the reading is taken on an unsettled range and
+    is not accurate to specification; that is reported, never hidden, because
+    the user may be deliberately trading accuracy for speed.
+    """
+    need = range_settling_s(range_A)
+    if read_settle_s + 1e-12 < need:
+        return (f"read settle {read_settle_s * 1e3:.3g} ms is shorter than the "
+                f"{need * 1e3:.3g} ms the {range_A:g} A range needs to settle "
+                "(~6 time constants); readings are not settled to specification")
+    return None
+
+
+def _emit_read_adc_setup(channel, nplc, measure_avg, measure_delay="off"):
+    """LUA lines fixing a read channel's ADC state completely, for speed AND accuracy.
+
+    - measure.delay = 0: the instrument default on the 2634B/2635B/2636B is
+      DELAY_AUTO, which silently inserted the range settling time (2.5 ms on
+      1 uA, 15 ms on 100 nA, 90 ms on 10 nA) before EVERY read, on top of the
+      script's own read_settle — shifting every read later than requested and,
+      on low ranges, halving the pulse rate. Settling is now the script's
+      read_settle alone, checked against the range by check_read_settle().
+    - nplc, then AUTOZERO_ONCE: OFF alone reuses the cached reference and zero
+      "regardless of age", and accuracy "will drift with time and
+      temperature"; the manual's remedy is ONCE just before the sequence. The
+      cache is per aperture, so ONCE must follow the nplc write. It costs two
+      conversions once and then behaves as OFF.
+    - count and filter set unconditionally (_emit_measurement_state).
+    - The channel's own measure.delay and autozero are saved first and put back
+      by _emit_restore_adc at cleanup. Their defaults differ by model (delay is
+      AUTO on 263x, OFF on 260x/261x), so no value can be hardcoded, and without
+      the restore a J-V or transistor run later in the session inherited
+      delay = 0. Saved only if not already saved: a second setup of the same
+      channel, or a previous run that aborted before restoring, must not
+      overwrite the original with this script's own value.
+
+    measure_delay='auto' keeps DELAY_AUTO, for reads where the range may change
+    (autorange) and timing does not matter — retention — because there the
+    instrument's range settling is the only settling the read gets.
+    """
+    delay_value = {"off": "0", "auto": f"{channel}.DELAY_AUTO"}[measure_delay]
+    lines = [f"if _syn_saved_delay_{channel} == nil then "
+             f"_syn_saved_delay_{channel} = {channel}.measure.delay end",
+             f"if _syn_saved_az_{channel} == nil then "
+             f"_syn_saved_az_{channel} = {channel}.measure.autozero end",
+             f"{channel}.measure.delay = {delay_value}",
+             f"{channel}.measure.nplc = {nplc}"]
+    lines.extend(_emit_measurement_state(channel, measure_avg))
+    lines.append(f"{channel}.measure.autozero = {channel}.AUTOZERO_ONCE")
+    return lines
+
+
+def _emit_restore_adc(channel):
+    """LUA lines putting back the measure.delay and autozero saved by
+    _emit_read_adc_setup, so nothing this suite sets outlives its run."""
+    return [f"if _syn_saved_delay_{channel} ~= nil then "
+            f"{channel}.measure.delay = _syn_saved_delay_{channel} "
+            f"_syn_saved_delay_{channel} = nil end",
+            f"if _syn_saved_az_{channel} ~= nil then "
+            f"{channel}.measure.autozero = _syn_saved_az_{channel} "
+            f"_syn_saved_az_{channel} = nil end"]
+
+
+def lua_delay(seconds, label="delay"):
+    """A LUA delay() statement, or '' for zero. The 2600 rejects delay(0)
+    ("You cannot set a delay for zero seconds", RM 7-47), which aborted a whole
+    script whenever a user asked for a 0 ms read delay."""
+    s = float(seconds)
+    if not np.isfinite(s) or s < 0:
+        raise ValueError(f"{label} must be a finite non-negative time, got {seconds!r} s")
+    return f"delay({s!r})" if s > 0 else ""
+
+
+def _drain_output(instrument, max_lines=1000):
+    """Discard anything left in the instrument's output queue before a run.
+
+    A completion token left over from an earlier run otherwise ends the next
+    _wait_lua_complete immediately and drops that run's timing report.
+    """
+    old = instrument.timeout
+    instrument.timeout = 100
+    drained = []
+    try:
+        for _ in range(max_lines):
+            try:
+                line = instrument.read()
+            except Exception:
+                break
+            drained.append(line)
+    finally:
+        instrument.timeout = old
+    if drained:
+        print(f"  [LUA] discarded {len(drained)} stale output line(s) before upload: "
+              f"{[l.strip() for l in drained[:3]]}")
+    return drained
+
+
+# Significant digits for printbuffer(). The default is 6, which quantised
+# timestamps to 1 ms beyond 100 s and 10 ms beyond 1000 s, so the drift
+# analysis of a long run raised alarms on spacing that was exact.
+ASCII_PRECISION = 15
+
+
+def _set_ascii_precision(instrument):
+    instrument.write(f"format.asciiprecision = {ASCII_PRECISION}")
+
+
 def derive_measurement_averaging(params):
     """Resolve (nplc, measure_avg) for a pulse-read measurement.
 
@@ -285,65 +419,148 @@ def get_fixed_current_range(compliance_A):
     return ranges[-1]
 
 
+# Lateness (s) under which an absolute-timer edge is not counted as an overrun:
+# TSP command latency, not a missed deadline.
+EDGE_LATE_TOL_S = 1e-4
+
+# Per-cycle TSP command overhead in the LUA pulse-read path (not physical relay
+# settling — TSP writes return immediately). Measured on a 2636B: ~2 ms of
+# cumulative command latency per pulse (level writes + measure.i call +
+# timer.measure.t check + buffer append).
+LUA_OVERHEAD_MS = 2.0
+
+
+class LuaScriptStartedError(RuntimeError):
+    """A failure after `endscript` was sent: the script had already started.
+
+    The device may be partly stimulated, so the measurement must NOT be silently
+    re-run on another path — that re-run would start from a modified device and
+    report its altered state as the pre-stimulus baseline.
+    """
+
+
+class LuaScript(str):
+    """Generated TSP source that also carries the feasibility facts computed
+    while generating it (`.facts`), so callers need not recompute them."""
+
+    def __new__(cls, text, **facts):
+        script = super().__new__(cls, text)
+        script.facts = facts
+        return script
+
+
+def _check_channels(stim_ch, read_ch):
+    if str(stim_ch).lower() == str(read_ch).lower():
+        raise ValueError(
+            f"stim_ch and read_ch are both {stim_ch!r}: one SMU cannot be the "
+            "stimulus source and the read source at once (the stimulus level "
+            "overwrites the read bias and every current after pulse 1 is "
+            "meaningless). Use two different SMU channels."
+        )
+
+
+def _check_times_ms(nonneg=None, positive=None):
+    """Raise a clear ValueError for a negative (or non-finite) user time."""
+    for label, v in (nonneg or {}).items():
+        if not np.isfinite(v) or v < 0:
+            raise ValueError(f"{label} must be a finite time >= 0 ms, got {v!r}")
+    for label, v in (positive or {}).items():
+        if not np.isfinite(v) or v <= 0:
+            raise ValueError(f"{label} must be a finite time > 0 ms, got {v!r}")
+
+
+def _pulse_read_plan(stim_ch, read_ch, params):
+    """Validated, resolved timing facts for one pulse-read sequence.
+
+    Single source for the LUA generator and the standard path, so both resolve
+    the same defaults, the same fixed range and the same feasibility verdicts.
+    """
+    _check_channels(stim_ch, read_ch)
+    stim_width_ms = params['stim_width_ms']
+    stim_period_ms = params['stim_period_ms']
+    read_delay_ms = params.get('read_delay_ms', 10)
+    read_settle_delay_ms = params.get('read_settle_delay_ms', 5)
+    settle_ms = params.get('settle_ms', 5)
+    _check_times_ms(
+        nonneg={'read_delay_ms': read_delay_ms,
+                'read_settle_delay_ms': read_settle_delay_ms,
+                'settle_ms': settle_ms},
+        positive={'stim_width_ms': stim_width_ms, 'stim_period_ms': stim_period_ms})
+
+    nplc, measure_avg = derive_measurement_averaging(params)
+    measurement_time_ms = nplc * (1000.0 / _line_freq_hz(params)) * measure_avg
+    fixed_i_range = get_fixed_current_range(params['compliance_A'])
+    return {
+        'stim_width_ms': stim_width_ms, 'stim_period_ms': stim_period_ms,
+        'read_delay_ms': read_delay_ms, 'read_settle_delay_ms': read_settle_delay_ms,
+        'settle_ms': settle_ms, 'nplc': nplc, 'measure_avg': measure_avg,
+        'measurement_time_ms': measurement_time_ms, 'fixed_i_range': fixed_i_range,
+        'min_period_ms': (stim_width_ms + read_delay_ms + read_settle_delay_ms
+                          + measurement_time_ms + LUA_OVERHEAD_MS),
+        'settle_warning': check_read_settle(read_settle_delay_ms / 1000.0, fixed_i_range),
+    }
+
+
 def generate_pulse_read_lua_script(stim_ch, read_ch, params):
     """
     Generates LUA script for fast pulse-read sequences on Keithley.
     Optimized for 2636A compatibility.
+
+    Returns a LuaScript (a str) whose `.facts` hold `min_period_ms` (the shortest
+    period this sequence can actually deliver) and `settle_warning`.
     """
 
     # Extract parameters
     stim_drive_type = params['stim_drive_type']
     stim_level = params['stim_level']
-    stim_width_ms = params['stim_width_ms']
-    stim_period_ms = params['stim_period_ms']
     n_pulses = params['n_pulses']
     read_voltage = params['read_voltage']
-    read_delay_ms = params.get('read_delay_ms', 10)
-    read_settle_delay_ms = params.get('read_settle_delay_ms', 5)
     compliance_A = params['compliance_A']
-    settle_ms = params.get('settle_ms', 5)
     max_voltage = params.get('max_voltage', 10.0)
 
     line_freq_hz = _line_freq_hz(params)
-    NPLC_PERIOD_MS = 1000.0 / line_freq_hz
-    nplc, measure_avg = derive_measurement_averaging(params)
+    plan = _pulse_read_plan(stim_ch, read_ch, params)
+    stim_width_ms = plan['stim_width_ms']
+    stim_period_ms = plan['stim_period_ms']
+    read_delay_ms = plan['read_delay_ms']
+    read_settle_delay_ms = plan['read_settle_delay_ms']
+    nplc, measure_avg = plan['nplc'], plan['measure_avg']
+    measurement_time_ms = plan['measurement_time_ms']
+    min_required_period = plan['min_period_ms']
+    fixed_i_range = plan['fixed_i_range']
 
     # Validation checks
     KEITHLEY_MAX_BUFFER_SIZE = 50000
     if n_pulses + 1 > KEITHLEY_MAX_BUFFER_SIZE:
         raise ValueError(f"Pulse count ({n_pulses}) exceeds buffer capacity.")
 
-    measurement_time_ms = nplc * NPLC_PERIOD_MS * measure_avg
-    # Per-cycle TSP command overhead in the LUA path (not physical relay
-    # settling — TSP source.output writes return immediately and the
-    # relay closes asynchronously while delay() runs). Measured on a
-    # 2636B: ~2 ms of cumulative command latency per pulse (two
-    # source.output writes + two source.levelv writes + measure.i call
-    # + timer.measure.t check + buffer append).
-    LUA_OVERHEAD_MS = 2.0
-    min_required_period = (stim_width_ms + read_delay_ms + read_settle_delay_ms
-                           + measurement_time_ms + LUA_OVERHEAD_MS)
-
     if stim_period_ms < min_required_period:
         print(f"⚠️  Requested period ({stim_period_ms:.2f} ms) shorter than minimum for zero-drift "
               f"({min_required_period:.2f} ms = stim {stim_width_ms:g} + read_delay {read_delay_ms:g} + "
               f"settle {read_settle_delay_ms:g} + meas {measurement_time_ms:.2f} + "
               f"LUA overhead {LUA_OVERHEAD_MS:g}). Instrument will run as fast as possible.")
-    
+    if plan['settle_warning']:
+        print(f"⚠️  {plan['settle_warning']}")
+
     # Convert times to seconds for LUA
     stim_width_s = stim_width_ms / 1000.0
     stim_period_s = stim_period_ms / 1000.0
     read_delay_s = read_delay_ms / 1000.0
     read_settle_delay_s = read_settle_delay_ms / 1000.0
-    settle_s = settle_ms / 1000.0
+    settle_s = plan['settle_ms'] / 1000.0
 
-    fixed_i_range = get_fixed_current_range(compliance_A)
+    stim_level_attr = 'levelv' if stim_drive_type == 'V' else 'leveli'
+    adc_setup = "\n".join(_emit_read_adc_setup(read_ch, nplc, measure_avg))
 
     # Generate LUA script
     lua_script = f"""
 -- Fast Synapse Pulse-Read Sequence (2636A Compatible)
--- Read voltage is TOGGLED per pulse (0V idle, read_voltage during measure)
+-- Read voltage is level-switched per pulse (0V idle, read_voltage during measure)
 -- to match standard execution path behavior.
+-- The stimulus output is switched ON once, at level 0, and only its LEVEL changes
+-- afterwards (as in the cycle and STDP scripts). With the default offmode NORMAL,
+-- OUTPUT_OFF does not open the relay: it holds 0 V at a 1 mA off-limit (RM 2-77),
+-- so toggling it every pulse disconnected nothing and only added latency.
 
 -- Synchronise ADC to mains for normal-mode rejection of line-frequency pickup
 localnode.linefreq = {int(line_freq_hz)}
@@ -351,13 +568,8 @@ localnode.linefreq = {int(line_freq_hz)}
 -- Configuration
 local n_pulses = {n_pulses}
 local stim_level = {stim_level}
-local stim_width = {stim_width_s}
 local stim_period = {stim_period_s}
 local read_voltage = {read_voltage}
-local read_delay = {read_delay_s}
-local read_settle = {read_settle_delay_s}
-local settle_time = {settle_s}
-local measure_avg = {measure_avg}
 
 -- Buffer Configuration
 -- Buffer capacity is READ-ONLY on the 2600 series; it cannot be
@@ -375,13 +587,16 @@ local measure_avg = {measure_avg}
 {read_ch}.source.levelv = 0
 {read_ch}.source.limiti = {compliance_A}
 {read_ch}.measure.rangei = {fixed_i_range}
-{read_ch}.measure.autozero = {read_ch}.AUTOZERO_OFF
 {read_ch}.measure.autorangei = {read_ch}.AUTORANGE_OFF
--- (Filter state is set explicitly later, below the stim configuration —
---  no need to pre-disable it here, which only created a transient OFF.)
+
+-- ADC state, fully determined here. Averaging is the 2600 repeat-average filter:
+-- filter.count = N integrations averaged per measure.i() call, measure.count = 1,
+-- so one (averaged) value is appended per pulse — the 1-pulse-1-entry contract
+-- the host expects. measure.delay = 0 removes the hidden DELAY_AUTO settling.
+{adc_setup}
 
 {read_ch}.source.output = {read_ch}.OUTPUT_ON
-delay(settle_time)
+{lua_delay(settle_s, 'settle_ms')}
 
 -- Configure stimulus channel"""
 
@@ -393,31 +608,17 @@ delay(settle_time)
 {stim_ch}.source.rangev = {fixed_v_range}
 {stim_ch}.source.limiti = {compliance_A}"""
     else:
+        # The source range must contain the SOURCED current, not the compliance
+        # (which limits the measured/sensed side).
         lua_script += f"""
 {stim_ch}.source.func = {stim_ch}.OUTPUT_DCAMPS
 {stim_ch}.source.leveli = 0
-{stim_ch}.source.rangei = {fixed_i_range}
+{stim_ch}.source.rangei = {get_fixed_current_range(abs(stim_level))}
 {stim_ch}.source.limitv = {max_voltage}"""
 
     lua_script += f"""
--- Stim channel starts OFF (relay open) — turned ON/OFF per pulse
--- to physically disconnect the load between pulses.
--- Level changes alone cannot discharge capacitive loads fast enough
--- when current is compliance-limited.
-
--- Configure measurement.
--- HARDWARE AVERAGING via the 2600 repeat-average filter:
---   filter.count = N integrations averaged per measure.i() call
---   filter.type  = REPEAT_AVG (true arithmetic mean of N consecutive ADCs)
---   measure.count = 1   →  one (averaged) value appended to buffer per pulse
--- This preserves the 1-pulse-1-buffer-entry contract the host expects.
--- Setting measure.count = N instead writes N raw readings to the buffer
--- per pulse, which the retrieval loop then mis-aligns.
-{read_ch}.measure.count = 1
-{read_ch}.measure.nplc = {nplc}
-{read_ch}.measure.filter.count = {measure_avg if measure_avg > 1 else 1}
-{read_ch}.measure.filter.type = {read_ch}.FILTER_REPEAT_AVG
-{read_ch}.measure.filter.enable = {read_ch}.{'FILTER_ON' if measure_avg > 1 else 'FILTER_OFF'}
+-- Stim output ON once, at level 0; pulses are level changes only.
+{stim_ch}.source.output = {stim_ch}.OUTPUT_ON
 
 -- Reset timer before the initial read so every buffer timestamp shares a
 -- single reference. Otherwise t[0] would sit on whatever the timer held
@@ -425,9 +626,9 @@ delay(settle_time)
 -- milliseconds and contaminates the drift summary.
 timer.reset()
 
--- Initial read (toggle read voltage: 0V → read_voltage → measure → 0V)
+-- Initial read (level-switch read voltage: 0V → read_voltage → measure → 0V)
 {read_ch}.source.levelv = read_voltage
-delay(read_settle)
+{lua_delay(read_settle_delay_s, 'read_settle_delay_ms')}
 {read_ch}.measure.i({read_ch}.nvbuffer1)
 {read_ch}.source.levelv = 0
 
@@ -439,25 +640,15 @@ local overruns = 0
 local worst_overrun = 0
 for pulse = 1, n_pulses do
     t_next = t_next + stim_period
-    -- Stimulus ON: set level then close relay"""
-
-    if stim_drive_type == 'V':
-        lua_script += f"""
-    {stim_ch}.source.levelv = stim_level"""
-    else:
-        lua_script += f"""
-    {stim_ch}.source.leveli = stim_level"""
-
-    lua_script += f"""
-    {stim_ch}.source.output = {stim_ch}.OUTPUT_ON
-    delay(stim_width)
-    -- Stimulus OFF: open relay (physically disconnects load)
-    {stim_ch}.source.output = {stim_ch}.OUTPUT_OFF
+    -- Stimulus ON: raise the level, hold for the pulse width, return to 0
+    {stim_ch}.source.{stim_level_attr} = stim_level
+    {lua_delay(stim_width_s, 'stim_width_ms')}
+    {stim_ch}.source.{stim_level_attr} = 0
 
     -- Read: apply read voltage, settle, measure, return to 0V
-    delay(read_delay)
+    {lua_delay(read_delay_s, 'read_delay_ms')}
     {read_ch}.source.levelv = read_voltage
-    delay(read_settle)
+    {lua_delay(read_settle_delay_s, 'read_settle_delay_ms')}
     {read_ch}.measure.i({read_ch}.nvbuffer1)
     {read_ch}.source.levelv = 0
 
@@ -480,9 +671,14 @@ for pulse = 1, n_pulses do
     end
 end
 
--- Cleanup
+-- Cleanup: levels to 0 BEFORE the outputs go off, filter off on the read channel
+-- (a left-over ON/count state leaks into the next run's reads).
+{stim_ch}.source.{stim_level_attr} = 0
+{read_ch}.source.levelv = 0
 {stim_ch}.source.output = {stim_ch}.OUTPUT_OFF
 {read_ch}.source.output = {read_ch}.OUTPUT_OFF
+{read_ch}.measure.filter.enable = {read_ch}.FILTER_OFF
+{chr(10).join(_emit_restore_adc(read_ch))}
 
 -- Timing report: how often the requested period could NOT be met, and by how
 -- much at worst. Printed before the completion token so the host records what
@@ -494,7 +690,9 @@ print(string.format("{LUA_TIMING_TOKEN} overruns=%d worst_ms=%.4f n_pulses=%d",
 print("{LUA_DONE_TOKEN}")
 """
 
-    return lua_script
+    return LuaScript(lua_script, min_period_ms=min_required_period,
+                     settle_warning=plan['settle_warning'],
+                     fixed_i_range=fixed_i_range)
 
 
 # =============================================================================
@@ -525,8 +723,11 @@ def generate_visual_synapse_lua_script(stim_ch, read_ch, params):
             - nplc (float): Integration time in power line cycles
 
     Returns:
-        str: LUA script for visual synapse measurement
+        LuaScript: LUA script for visual synapse measurement; `.facts` holds
+        `settle_warning`.
     """
+
+    _check_channels(stim_ch, read_ch)
 
     # Extract parameters
     light_voltage = params['light_pulse_voltage']
@@ -539,6 +740,11 @@ def generate_visual_synapse_lua_script(stim_ch, read_ch, params):
     compliance_A = params['compliance_A']
     nplc = params.get('nplc', 1.0)
     line_freq_hz = _line_freq_hz(params)
+
+    _check_times_ms(
+        nonneg={'measure_start_delay_ms': measure_start_delay_ms,
+                'measure_end_margin_ms': measure_end_margin_ms},
+        positive={'pulse_width_ms': pulse_width_ms, 'pulse_period_ms': pulse_period_ms})
 
     # Validation
     measurement_window_ms = pulse_width_ms - measure_start_delay_ms - measure_end_margin_ms
@@ -557,7 +763,6 @@ def generate_visual_synapse_lua_script(stim_ch, read_ch, params):
     # the 2600-series filter.count hardware ceiling. Fail loudly when not even a
     # single integration fits: that is a genuine configuration error, not
     # something to silently paper over.
-    FILTER_COUNT_MAX = 100  # 2600-series measure.filter.count hardware limit
     single_integration_ms = nplc * (1000.0 / line_freq_hz)
     if single_integration_ms > measurement_window_ms:
         raise ValueError(
@@ -586,26 +791,24 @@ def generate_visual_synapse_lua_script(stim_ch, read_ch, params):
     pulse_width_s = pulse_width_ms / 1000.0
     pulse_period_s = pulse_period_ms / 1000.0
     measure_start_delay_s = measure_start_delay_ms / 1000.0
-    measure_end_margin_s = measure_end_margin_ms / 1000.0
 
     # The pulse must contain its own light-on time.
     if pulse_period_s < pulse_width_s:
         raise ValueError(f"Pulse period ({pulse_period_ms}ms) must be >= pulse width ({pulse_width_ms}ms)")
 
-    # Determine optimal fixed range for current measurement
-    def get_fixed_current_range(compliance_A):
-        ranges = [100e-12, 1e-9, 10e-9, 100e-9, 1e-6, 10e-6, 100e-6, 1e-3, 10e-3, 100e-3, 1.0, 3.0, 10.0]
-        for r in ranges:
-            if compliance_A <= r:
-                return r
-        return ranges[-1]
-
     fixed_i_range = get_fixed_current_range(compliance_A)
 
-    # Determine voltage range for LED driver (model-aware: native ranges differ
-    # between the 40 V and 200 V families).
+    # Model-aware native voltage ranges (the 40 V and 200 V families differ).
     max_voltage = params.get('max_voltage', 200.0)
     fixed_v_range = _get_fixed_voltage_range(light_voltage, max_voltage)
+    read_v_range = _get_fixed_voltage_range(0.0, max_voltage)
+
+    # The photocurrent is read measure_start_delay after the LED turns on; with
+    # measure.delay = 0 that interval is the range's only settling time.
+    settle_warning = check_read_settle(measure_start_delay_s, fixed_i_range)
+    if settle_warning:
+        print(f"⚠️  {settle_warning}")
+    adc_setup = "\n".join(_emit_read_adc_setup(read_ch, nplc, readings_per_pulse))
 
     # Generate LUA script
     lua_script = f"""
@@ -616,13 +819,11 @@ def generate_visual_synapse_lua_script(stim_ch, read_ch, params):
 localnode.linefreq = {int(line_freq_hz)}
 
 -- Configuration
-local stim_ch = {stim_ch}
-local read_ch = {read_ch}
 local n_pulses = {n_pulses}
 local light_voltage = {light_voltage}
 local pulse_width = {pulse_width_s}
 local measure_start_delay = {measure_start_delay_s}
-local readings_per_pulse = {readings_per_pulse}
+local late_tol = {EDGE_LATE_TOL_S}
 
 -- Buffer Configuration
 -- Buffer capacity is READ-ONLY on the 2600 series; it cannot be
@@ -637,18 +838,11 @@ local readings_per_pulse = {readings_per_pulse}
 -- Configure read channel (Jsc measurement at 0V)
 {read_ch}.source.func = {read_ch}.OUTPUT_DCVOLTS
 {read_ch}.source.levelv = 0
-{read_ch}.source.rangev = 0.2
+{read_ch}.source.rangev = {read_v_range}
 {read_ch}.source.limiti = {compliance_A}
 {read_ch}.measure.rangei = {fixed_i_range}
-{read_ch}.measure.autozero = {read_ch}.AUTOZERO_OFF
 {read_ch}.measure.autorangei = {read_ch}.AUTORANGE_OFF
-{read_ch}.measure.nplc = {nplc}
-{read_ch}.measure.count = 1
-
--- Configure hardware averaging filter
-{read_ch}.measure.filter.enable = {read_ch}.FILTER_ON
-{read_ch}.measure.filter.type = {read_ch}.FILTER_REPEAT_AVG
-{read_ch}.measure.filter.count = {readings_per_pulse}
+{adc_setup}
 
 -- Configure stimulus channel (LED driver)
 {stim_ch}.source.func = {stim_ch}.OUTPUT_DCVOLTS
@@ -656,8 +850,12 @@ local readings_per_pulse = {readings_per_pulse}
 {stim_ch}.source.rangev = {fixed_v_range}
 {stim_ch}.source.limiti = {compliance_A}
 
--- Turn on read channel (0V for Jsc); stim starts OFF (relay open)
+-- Both outputs ON once, at 0 V. The LED is pulsed by LEVEL changes only: with
+-- the default offmode NORMAL, OUTPUT_OFF holds 0 V at a 1 mA off-limit rather
+-- than opening the relay (RM 2-77), so toggling it per pulse disconnected
+-- nothing and only added latency.
 {read_ch}.source.output = {read_ch}.OUTPUT_ON
+{stim_ch}.source.output = {stim_ch}.OUTPUT_ON
 delay(0.01)
 
 -- Pulse-Measure loop (absolute-timer based to prevent cumulative drift).
@@ -666,21 +864,24 @@ delay(0.01)
 -- NOT depend on the ADC integration time. The photocurrent is measured
 -- measure_start_delay into the pulse; host-side clamping guarantees the
 -- integration finishes inside the pulse (>= measure_end_margin before LED off).
--- Stim uses OUTPUT_ON/OUTPUT_OFF relay toggling to physically disconnect the
--- LED between pulses — level changes alone cannot discharge capacitive loads
--- fast enough when current is compliance-limited.
 local pulse_period = {pulse_period_s}
+local overruns = 0
+local worst_overrun = 0
 timer.reset()
 local t_pulse_start = 0
 for pulse = 1, n_pulses do
     -- Wait out the previous period's tail so this pulse starts on its absolute
     -- grid point (t_pulse_start), independent of accumulated measurement time.
     local t_wait_start = t_pulse_start - timer.measure.t()
-    if t_wait_start > 0 then delay(t_wait_start) end
+    if t_wait_start > 0 then
+        delay(t_wait_start)
+    elseif -t_wait_start > late_tol then
+        overruns = overruns + 1
+        if -t_wait_start > worst_overrun then worst_overrun = -t_wait_start end
+    end
 
-    -- Light pulse ON: set voltage then close relay
+    -- Light pulse ON
     {stim_ch}.source.levelv = light_voltage
-    {stim_ch}.source.output = {stim_ch}.OUTPUT_ON
 
     -- Open the measurement window measure_start_delay into the pulse, then
     -- measure (hardware averaging active; this call blocks for the ADC time).
@@ -688,29 +889,81 @@ for pulse = 1, n_pulses do
     if t_meas > 0 then delay(t_meas) end
     {read_ch}.measure.i({read_ch}.nvbuffer1)
 
-    -- Hold the light ON until the full pulse_width has elapsed, THEN open the
-    -- relay. This absolute LED-off deadline is what makes the delivered dose
+    -- Hold the light ON until the full pulse_width has elapsed, THEN drop the
+    -- level. This absolute LED-off deadline is what makes the delivered dose
     -- equal intensity x pulse_width for every pulse.
     local t_off = t_pulse_start + pulse_width - timer.measure.t()
     if t_off > 0 then delay(t_off) end
-    {stim_ch}.source.output = {stim_ch}.OUTPUT_OFF
+    {stim_ch}.source.levelv = 0
 
     -- Advance to the next pulse's absolute start (no cumulative drift)
     t_pulse_start = t_pulse_start + pulse_period
 end
 
--- Cleanup
+-- Cleanup: levels to 0 BEFORE the outputs go off, filter off on the read channel
+{stim_ch}.source.levelv = 0
+{read_ch}.source.levelv = 0
 {stim_ch}.source.output = {stim_ch}.OUTPUT_OFF
 {read_ch}.source.output = {read_ch}.OUTPUT_OFF
-
--- Disable filter
 {read_ch}.measure.filter.enable = {read_ch}.FILTER_OFF
+{chr(10).join(_emit_restore_adc(read_ch))}
+
+print(string.format("{LUA_TIMING_TOKEN} overruns=%d worst_ms=%.4f n_pulses=%d",
+                    overruns, worst_overrun * 1000, n_pulses))
 
 -- Completion token (host reads this to detect script end)
 print("{LUA_DONE_TOKEN}")
 """
 
-    return lua_script
+    return LuaScript(lua_script, settle_warning=settle_warning,
+                     fixed_i_range=fixed_i_range)
+
+
+def visual_continuous_plan(params):
+    """Validated timing facts for the continuous I(t) sequence.
+
+    Shared by the generator and visual_synapse_sequence so the buffer-size
+    bound is computed once. The bound is exact for the sampling grid the script
+    uses (one sample per interval from t = 0 to the end of the post-pulse tail),
+    not padded.
+    """
+    pulse_width_ms = params['pulse_width_ms']
+    pulse_period_ms = params['pulse_period_ms']
+    n_pulses = params['n_pulses']
+    nplc = params.get('nplc', 0.1)  # Lower NPLC for faster sampling in continuous mode
+    sample_interval_ms = params.get('sample_interval_ms', 1.0)
+    _check_times_ms(positive={'pulse_width_ms': pulse_width_ms,
+                              'pulse_period_ms': pulse_period_ms,
+                              'sample_interval_ms': sample_interval_ms})
+    if pulse_period_ms < pulse_width_ms:
+        raise ValueError(f"Pulse period ({pulse_period_ms}ms) must be >= pulse width ({pulse_width_ms}ms)")
+    if n_pulses < 1:
+        raise ValueError(f"n_pulses must be >= 1, got {n_pulses!r}")
+
+    sample_dur_ms = nplc * (1000.0 / _line_freq_hz(params))
+    # Dark samples kept after the last pulse: up to 10 intervals, never past
+    # the end of that pulse's period.
+    tail_ms = min(10.0 * sample_interval_ms, pulse_period_ms - pulse_width_ms)
+    span_ms = (n_pulses - 1) * pulse_period_ms + pulse_width_ms + tail_ms
+    max_samples = int(span_ms / sample_interval_ms + 1e-9) + 1
+
+    sample_warning = None
+    if sample_dur_ms > sample_interval_ms:
+        sample_warning = (
+            f"one ADC sample ({sample_dur_ms:.3g} ms = nplc {nplc:g} / "
+            f"{_line_freq_hz(params):g} Hz) is longer than the requested "
+            f"{sample_interval_ms:g} ms sample interval; samples are taken back to "
+            "back on the next free interval boundary, so the delivered spacing is "
+            "longer than requested. Lower NPLC or raise the sample interval.")
+    fixed_i_range = get_fixed_current_range(params['compliance_A'])
+    # No settled reading is possible faster than the range settles (measure.delay = 0).
+    settle_warning = check_read_settle(sample_interval_ms / 1000.0, fixed_i_range)
+    return {
+        'sample_dur_ms': sample_dur_ms, 'sample_interval_ms': sample_interval_ms,
+        'tail_ms': tail_ms, 'max_samples': max_samples, 'nplc': nplc,
+        'fixed_i_range': fixed_i_range, 'sample_warning': sample_warning,
+        'settle_warning': settle_warning,
+    }
 
 
 def generate_visual_continuous_lua_script(stim_ch, read_ch, params):
@@ -720,58 +973,54 @@ def generate_visual_continuous_lua_script(stim_ch, read_ch, params):
     This mode provides I(t) data - continuous current vs time, useful for
     analyzing transient photocurrent dynamics.
 
+    The light pulse edges (ON at k*period, OFF at k*period + width) are scheduled
+    on the absolute timer, independently of sampling. Samples are taken on the
+    absolute grid j*sample_interval between edges, and a sample is only started
+    if its whole ADC integration finishes before the next edge, so sampling can
+    never stretch a pulse or delay the next one.
+
     Args:
         stim_ch (str): Stimulus channel for LED ('smua' or 'smub')
         read_ch (str): Read channel for current measurement ('smua' or 'smub')
         params (dict): Measurement parameters
 
     Returns:
-        str: LUA script for continuous visual synapse measurement
+        LuaScript: LUA script; `.facts` holds `max_samples` (buffer-size upper
+        bound), `sample_warning` and `settle_warning`.
     """
+
+    _check_channels(stim_ch, read_ch)
 
     # Extract parameters
     light_voltage = params['light_pulse_voltage']
-    pulse_width_ms = params['pulse_width_ms']
-    pulse_period_ms = params['pulse_period_ms']
     n_pulses = params['n_pulses']
     compliance_A = params['compliance_A']
-    nplc = params.get('nplc', 0.1)  # Lower NPLC for faster sampling in continuous mode
-    sample_interval_ms = params.get('sample_interval_ms', 1.0)  # How often to sample
     line_freq_hz = _line_freq_hz(params)
+    plan = visual_continuous_plan(params)
+    nplc = plan['nplc']
 
     # Convert times to seconds
-    pulse_width_s = pulse_width_ms / 1000.0
-    pulse_period_s = pulse_period_ms / 1000.0
-    sample_interval_s = sample_interval_ms / 1000.0
-
-    # Calculate total measurement time and expected samples
-    total_time_s = pulse_period_s * n_pulses
-    expected_samples = int(total_time_s / sample_interval_s) + n_pulses * 2  # Extra for safety
+    pulse_width_s = params['pulse_width_ms'] / 1000.0
+    pulse_period_s = params['pulse_period_ms'] / 1000.0
+    sample_interval_s = plan['sample_interval_ms'] / 1000.0
 
     # Check buffer capacity
     KEITHLEY_MAX_BUFFER_SIZE = 50000
-    if expected_samples > KEITHLEY_MAX_BUFFER_SIZE:
+    if plan['max_samples'] > KEITHLEY_MAX_BUFFER_SIZE:
         raise ValueError(
-            f"Expected samples ({expected_samples}) exceeds buffer capacity.\n"
+            f"Expected samples ({plan['max_samples']}) exceeds buffer capacity.\n"
             f"Reduce pulse count or increase sample interval."
         )
 
-    # Determine optimal fixed range
-    def get_fixed_current_range(compliance_A):
-        ranges = [100e-12, 1e-9, 10e-9, 100e-9, 1e-6, 10e-6, 100e-6, 1e-3, 10e-3, 100e-3, 1.0, 3.0, 10.0]
-        for r in ranges:
-            if compliance_A <= r:
-                return r
-        return ranges[-1]
+    for w in (plan['sample_warning'], plan['settle_warning']):
+        if w:
+            print(f"⚠️  {w}")
 
-    fixed_i_range = get_fixed_current_range(compliance_A)
+    fixed_i_range = plan['fixed_i_range']
     max_voltage = params.get('max_voltage', 200.0)
     fixed_v_range = _get_fixed_voltage_range(light_voltage, max_voltage)
-
-    # Calculate samples per pulse period
-    samples_per_period = int(pulse_period_s / sample_interval_s)
-    samples_during_pulse = int(pulse_width_s / sample_interval_s)
-    samples_between_pulses = samples_per_period - samples_during_pulse
+    read_v_range = _get_fixed_voltage_range(0.0, max_voltage)
+    adc_setup = "\n".join(_emit_read_adc_setup(read_ch, nplc, 1))
 
     lua_script = f"""
 -- Visual Synapse Continuous Mode - I(t) Measurement
@@ -781,14 +1030,14 @@ def generate_visual_continuous_lua_script(stim_ch, read_ch, params):
 localnode.linefreq = {int(line_freq_hz)}
 
 -- Configuration
-local stim_ch = {stim_ch}
-local read_ch = {read_ch}
 local n_pulses = {n_pulses}
 local light_voltage = {light_voltage}
 local pulse_width = {pulse_width_s}
+local pulse_period = {pulse_period_s}
 local sample_interval = {sample_interval_s}
-local samples_during_pulse = {samples_during_pulse}
-local samples_between_pulses = {samples_between_pulses}
+local sample_dur = {plan['sample_dur_ms'] / 1000.0}
+local tail = {plan['tail_ms'] / 1000.0}
+local late_tol = {EDGE_LATE_TOL_S}
 
 -- Buffer Configuration.
 -- Capacity is READ-ONLY on the 2600 series (Reference Manual: "Attribute (R)")
@@ -802,14 +1051,11 @@ local samples_between_pulses = {samples_between_pulses}
 -- Configure read channel (0V for Jsc)
 {read_ch}.source.func = {read_ch}.OUTPUT_DCVOLTS
 {read_ch}.source.levelv = 0
-{read_ch}.source.rangev = 0.2
+{read_ch}.source.rangev = {read_v_range}
 {read_ch}.source.limiti = {compliance_A}
 {read_ch}.measure.rangei = {fixed_i_range}
-{read_ch}.measure.autozero = {read_ch}.AUTOZERO_OFF
 {read_ch}.measure.autorangei = {read_ch}.AUTORANGE_OFF
-{read_ch}.measure.nplc = {nplc}
-{read_ch}.measure.count = 1
-{read_ch}.measure.filter.enable = {read_ch}.FILTER_OFF
+{adc_setup}
 
 -- Configure stimulus channel
 {stim_ch}.source.func = {stim_ch}.OUTPUT_DCVOLTS
@@ -817,61 +1063,74 @@ local samples_between_pulses = {samples_between_pulses}
 {stim_ch}.source.rangev = {fixed_v_range}
 {stim_ch}.source.limiti = {compliance_A}
 
--- Turn on read channel; stim starts OFF (relay open)
+-- Both outputs ON once, at 0 V; the LED is pulsed by LEVEL changes only (see the
+-- note in the standard visual script on why OUTPUT_OFF is not toggled).
 {read_ch}.source.output = {read_ch}.OUTPUT_ON
+{stim_ch}.source.output = {stim_ch}.OUTPUT_ON
 delay(0.01)
 
--- Continuous sampling during pulse sequence (timer-based to prevent cumulative drift)
--- Stim uses relay toggling to physically disconnect LED between pulses.
 timer.reset()
-local sample_count = 0
-for pulse = 1, n_pulses do
-    -- Light pulse ON: set voltage then close relay
-    {stim_ch}.source.levelv = light_voltage
-    {stim_ch}.source.output = {stim_ch}.OUTPUT_ON
+local k = 0
+local overruns = 0
+local worst_overrun = 0
 
-    -- Sample during pulse
-    for s = 1, samples_during_pulse do
-        sample_count = sample_count + 1
-        local t_target = sample_count * sample_interval
-        local t_wait = t_target - timer.measure.t()
-        if t_wait > 0 then delay(t_wait) end
+-- Block until the absolute time t_edge. An edge reached later than late_tol
+-- is counted, so a pulse that did not start/stop on schedule is reported.
+local function wait_until(t_edge)
+    local w = t_edge - timer.measure.t()
+    if w > 0 then
+        delay(w)
+    elseif -w > late_tol then
+        overruns = overruns + 1
+        if -w > worst_overrun then worst_overrun = -w end
+    end
+end
+
+-- Sample on the absolute grid k*sample_interval until t_stop, then land on
+-- t_stop. A sample whose integration would run past t_stop is not started, so
+-- the next edge is never delayed by an ADC conversion. If the ADC is slower
+-- than the interval, the next free grid point is used.
+local function sample_until(t_stop)
+    while true do
+        local now = timer.measure.t()
+        local kk = math.ceil(now / sample_interval - 1e-6)
+        if kk < k then kk = k end
+        local t_s = kk * sample_interval
+        if t_s + sample_dur > t_stop then break end
+        if t_s > now then delay(t_s - now) end
         {read_ch}.measure.i({read_ch}.nvbuffer1)
+        k = kk + 1
     end
-
-    -- Light pulse OFF: open relay
-    {stim_ch}.source.output = {stim_ch}.OUTPUT_OFF
-
-    -- Sample between pulses
-    if pulse < n_pulses and samples_between_pulses > 0 then
-        for s = 1, samples_between_pulses do
-            sample_count = sample_count + 1
-            local t_target = sample_count * sample_interval
-            local t_wait = t_target - timer.measure.t()
-            if t_wait > 0 then delay(t_wait) end
-            {read_ch}.measure.i({read_ch}.nvbuffer1)
-        end
-    end
+    wait_until(t_stop)
 end
 
--- Final samples after last pulse
-for s = 1, math.min(10, samples_between_pulses) do
-    sample_count = sample_count + 1
-    local t_target = sample_count * sample_interval
-    local t_wait = t_target - timer.measure.t()
-    if t_wait > 0 then delay(t_wait) end
-    {read_ch}.measure.i({read_ch}.nvbuffer1)
+for pulse = 0, n_pulses - 1 do
+    local t_on = pulse * pulse_period
+    sample_until(t_on)
+    {stim_ch}.source.levelv = light_voltage
+    sample_until(t_on + pulse_width)
+    {stim_ch}.source.levelv = 0
 end
 
--- Cleanup
+-- Dark samples after the last pulse
+sample_until((n_pulses - 1) * pulse_period + pulse_width + tail)
+
+-- Cleanup: levels to 0 BEFORE the outputs go off, filter off on the read channel
+{stim_ch}.source.levelv = 0
+{read_ch}.source.levelv = 0
 {stim_ch}.source.output = {stim_ch}.OUTPUT_OFF
 {read_ch}.source.output = {read_ch}.OUTPUT_OFF
+{read_ch}.measure.filter.enable = {read_ch}.FILTER_OFF
+{chr(10).join(_emit_restore_adc(read_ch))}
+
+print(string.format("{LUA_TIMING_TOKEN} overruns=%d worst_ms=%.4f n_pulses=%d",
+                    overruns, worst_overrun * 1000, n_pulses))
 
 -- Completion token (host reads this to detect script end)
 print("{LUA_DONE_TOKEN}")
 """
 
-    return lua_script
+    return LuaScript(lua_script, **plan)
 
 
 # =============================================================================
@@ -879,6 +1138,42 @@ print("{LUA_DONE_TOKEN}")
 # =============================================================================
 
 KEITHLEY_MAX_BUFFER_SIZE = 50000
+
+
+class LuaExecutionError(RuntimeError):
+    """A generated TSP script did not complete cleanly.
+
+    Carries what the instrument still holds so the caller can report it:
+    `buffer_counts` ({channel: "n/expected" or an 'unreadable' note}) and
+    `instrument_errors` (the error-queue entries). Never raised for a script
+    that finished and left a clean queue.
+    """
+
+    def __init__(self, message, buffer_counts=None, instrument_errors=None):
+        super().__init__(message)
+        self.buffer_counts = buffer_counts or {}
+        self.instrument_errors = instrument_errors or []
+
+
+def _current_drive_voltage_limit(cfg, label):
+    """Voltage compliance (V) for a current-driven stimulus.
+
+    Taken from an explicit `voltage_limit_V`, else the instrument ceiling
+    `max_voltage` stamped by the caller. Raises when neither is present: a
+    compliance voltage is a device-safety decision and is not guessed. (It used
+    to be derived from the read/stim LEVEL, i.e. 0.1-0.2 V, which starved a
+    current source of the voltage it needs to drive any real load.)
+    """
+    limit = cfg.get('voltage_limit_V', cfg.get('max_voltage'))
+    if limit is None:
+        raise ValueError(
+            f"{label}: current drive needs a voltage compliance. Set "
+            "'voltage_limit_V' (or 'max_voltage', the instrument ceiling) in the config."
+        )
+    limit = float(limit)
+    if not np.isfinite(limit) or limit <= 0:
+        raise ValueError(f"{label}: voltage compliance must be a positive finite voltage, got {limit!r}")
+    return limit
 
 
 def _validate_train_config(config, label="Train"):
@@ -898,6 +1193,23 @@ def _validate_train_config(config, label="Train"):
     for key in required:
         if key not in config:
             raise ValueError(f"{label}: Missing required parameter '{key}'")
+
+    for key in ('write_ch', 'read_ch'):
+        if config[key] not in ('smua', 'smub'):
+            raise ValueError(f"{label}: {key} must be 'smua' or 'smub', got {config[key]!r}")
+    drive = config.get('stim_drive_type', 'V')
+    if drive not in ('V', 'I'):
+        raise ValueError(f"{label}: stim_drive_type must be 'V' or 'I', got {drive!r}")
+    if drive == 'I':
+        _current_drive_voltage_limit(config, label)
+    if not (np.isfinite(config['stim_width_ms']) and config['stim_width_ms'] > 0):
+        raise ValueError(f"{label}: stim_width_ms must be > 0")
+    if not (np.isfinite(config['read_delay_ms']) and config['read_delay_ms'] >= 0):
+        raise ValueError(f"{label}: read_delay_ms must be >= 0")
+    if not (np.isfinite(config['compliance_A']) and config['compliance_A'] > 0):
+        raise ValueError(f"{label}: compliance_A must be > 0")
+    if int(config['n_pulses']) != config['n_pulses']:
+        raise ValueError(f"{label}: n_pulses must be a whole number, got {config['n_pulses']!r}")
 
     if config['topology'] == 'single':
         if config['write_ch'] != config['read_ch']:
@@ -956,18 +1268,26 @@ def generate_cycle_lua_script(train_a_config, train_b_config, n_cycles,
     Generates a single LUA script for on-instrument potentiation-depression cycling.
 
     Supports two channel topologies per train:
-    - Single-channel: Same SMU writes and reads (voltage switching)
+    - Single-channel: Same SMU writes and reads (voltage switching). The read
+      line returns to 0 V after every read, as in pulse-read, to limit read
+      disturb; it is raised to the read voltage only for read_delay + the ADC.
     - Dual-channel: One SMU writes, another reads at constant bias
 
     Args:
         train_a_config (dict): Train A configuration (see _validate_train_config)
         train_b_config (dict or None): Train B configuration, or None
         n_cycles (int): Number of A-B cycle repetitions
-        inter_train_delay_ms (float): Delay between Train A end and Train B start
-        inter_cycle_delay_ms (float): Delay between end of last train and next cycle
+        inter_train_delay_ms (float): Delay between the ACTUAL end of Train A and
+            the start of Train B
+        inter_cycle_delay_ms (float): Delay between the ACTUAL end of the last
+            train and the next cycle
 
     Returns:
-        tuple: (lua_script: str, buffer_map: dict)
+        tuple: (lua_script: str, buffer_map: dict). Besides the buffer layout,
+        each buffer_map['train_*'] entry carries the timing plan the host needs
+        to judge the run (requested period, achievable lower bound, drift
+        threshold, read-settle verdict) and buffer_map['feasible_time_s'] the
+        duration the script can actually take, which governs the host timeout.
     """
     # --- Validate ---
     _validate_train_config(train_a_config, "Train A")
@@ -975,10 +1295,73 @@ def generate_cycle_lua_script(train_a_config, train_b_config, n_cycles,
         _validate_train_config(train_b_config, "Train B")
     if n_cycles <= 0:
         raise ValueError("n_cycles must be > 0")
+    for name, delay_ms in (("inter_train_delay_ms", inter_train_delay_ms),
+                           ("inter_cycle_delay_ms", inter_cycle_delay_ms)):
+        if not (np.isfinite(delay_ms) and delay_ms >= 0):
+            raise ValueError(f"{name} must be a finite non-negative time, got {delay_ms!r}")
 
     # Mains line frequency drives the ADC integration aperture and rejection.
     # Both trains run on the same instrument/mains, so resolve once from Train A.
     line_freq_hz = _line_freq_hz(train_a_config)
+    NPLC_PERIOD_MS = 1000.0 / line_freq_hz
+
+    # --- Collect all unique channels ---
+    channels_used = {train_a_config['write_ch'], train_a_config['read_ch']}
+    if train_b_config:
+        channels_used.update({train_b_config['write_ch'], train_b_config['read_ch']})
+
+    # --- Compute derived values ---
+    def train_lua_params(cfg, label):
+        # The one averaging rule, shared with pulse-read. This function used its
+        # own copy, without the FP nudge, and disagreed on 35 of 35 settings at
+        # 60 Hz (59 vs 60 samples).
+        nplc, measure_avg = derive_measurement_averaging(
+            dict(cfg, line_freq_hz=line_freq_hz))
+        max_v = cfg.get('max_voltage', 200.0)
+        single = cfg['topology'] == 'single'
+        drive = cfg.get('stim_drive_type', 'V')
+        stim, read_v = abs(cfg['stim_level']), abs(cfg['read_voltage'])
+        fixed_i_range = _get_fixed_current_range(cfg['compliance_A'])
+        meas_time_ms = nplc * NPLC_PERIOD_MS * measure_avg
+        settle_s = cfg.get('settle_ms', 5) / 1000.0
+        read_delay_s = cfg['read_delay_ms'] / 1000.0
+        # What precedes a read after a bias CHANGE: the settle for the first
+        # read; on the single-channel line also read_delay on every pulse.
+        # Dual-channel per-pulse reads sit on a constant bias.
+        bias_change_settle_s = min(settle_s, read_delay_s) if single else settle_s
+        events_ms = [e for e in (cfg['stim_width_ms'], cfg['read_delay_ms'], meas_time_ms) if e > 0]
+        return {
+            'nplc': nplc,
+            'measure_avg': measure_avg,
+            'fixed_i_range': fixed_i_range,
+            # Source range the write role needs. Single-channel: the same SMU also
+            # sources the read voltage. Dual: the write SMU only sources the stimulus.
+            'write_v_range': (_get_fixed_voltage_range(max(stim, read_v), max_v) if single
+                              else _get_fixed_voltage_range(stim, max_v) if drive == 'V' else None),
+            # A current stimulus: the range must CONTAIN |stim_level| (it was
+            # derived from the compliance, giving a 5 mA pulse a 100 uA range) and
+            # the compliance is a VOLTAGE (it was the read/stim level, 0.1-0.2 V).
+            'write_i_range': _get_fixed_current_range(stim) if drive == 'I' else None,
+            'v_limit': _current_drive_voltage_limit(cfg, label) if drive == 'I' else None,
+            'read_v_range': _get_fixed_voltage_range(read_v, max_v),
+            'stim_width_s': cfg['stim_width_ms'] / 1000.0,
+            'stim_period_s': cfg['stim_period_ms'] / 1000.0,
+            'read_delay_s': read_delay_s,
+            'settle_s': settle_s,
+            'meas_time_ms': meas_time_ms,
+            # Lower bound of the loop's own work per pulse: the waits and the ADC
+            # integration it must perform. TSP command latency is on top and is
+            # hardware-dependent, so it is reported by the overrun count instead
+            # of being guessed here. (settle_ms is NOT per-pulse work: it only
+            # precedes the baseline read, and its inclusion overstated the
+            # minimum by 5 ms.)
+            'min_period_ms': cfg['stim_width_ms'] + cfg['read_delay_ms'] + meas_time_ms,
+            'drift_threshold_ms': max(0.1, min(1.0, 0.25 * min(events_ms))),
+            'read_settle_warning': check_read_settle(bias_change_settle_s, fixed_i_range),
+        }
+
+    a_lp = train_lua_params(train_a_config, "Train A")
+    b_lp = train_lua_params(train_b_config, "Train B") if train_b_config else None
 
     # --- Buffer map ---
     a_read = train_a_config['read_ch']
@@ -1003,64 +1386,32 @@ def generate_cycle_lua_script(train_a_config, train_b_config, n_cycles,
         if total_b > KEITHLEY_MAX_BUFFER_SIZE:
             raise ValueError(f"Train B buffer ({total_b} pts) exceeds capacity ({KEITHLEY_MAX_BUFFER_SIZE}).")
 
-    buffer_map = {
-        'train_a': {
-            'channel': a_read, 'buffer': 'nvbuffer1',
-            'n_points_per_cycle': pts_a_per_cycle,
-            'n_total': pts_a_per_cycle * n_cycles
-        }
-    }
-    if train_b_config:
-        buffer_map['train_b'] = {
-            'channel': b_read, 'buffer': 'nvbuffer1',
-            'n_points_per_cycle': pts_b_per_cycle,
-            'n_total': pts_b_per_cycle * n_cycles
-        }
-
-    # --- Collect all unique channels ---
-    channels_used = {train_a_config['write_ch'], train_a_config['read_ch']}
-    if train_b_config:
-        channels_used.update({train_b_config['write_ch'], train_b_config['read_ch']})
-
-    # --- Compute derived values ---
-    def train_lua_params(cfg):
-        nplc = cfg.get('nplc', 1.0)
-        NPLC_PERIOD_MS = 1000.0 / line_freq_hz
-        FILTER_COUNT_MAX = 100
-        read_width_ms = cfg.get('read_width_ms', None)
-        user_override = cfg.get('measure_avg_user')
-        measure_avg = 1
-        if read_width_ms is not None and read_width_ms > 0:
-            max_nplc = read_width_ms / NPLC_PERIOD_MS
-            if nplc > max_nplc:
-                nplc = max(0.001, max_nplc)
-        if user_override is not None and int(user_override) > 0:
-            measure_avg = max(1, min(int(user_override), FILTER_COUNT_MAX))
-        elif read_width_ms is not None and read_width_ms > 0:
-            measure_avg = max(1, min(
-                int(read_width_ms / (nplc * NPLC_PERIOD_MS)),
-                FILTER_COUNT_MAX,
-            ))
+    def plan(cfg, lp, pts_per_cycle):
         return {
-            'nplc': nplc,
-            'measure_avg': measure_avg,
-            'fixed_i_range': _get_fixed_current_range(cfg['compliance_A']),
-            'fixed_v_range': _get_fixed_voltage_range(
-                max(abs(cfg['stim_level']), abs(cfg['read_voltage'])),
-                cfg.get('max_voltage', 200.0)
-            ),
-            'fixed_read_v_range': _get_fixed_voltage_range(
-                cfg['read_voltage'],
-                cfg.get('max_voltage', 200.0)
-            ),
-            'stim_width_s': cfg['stim_width_ms'] / 1000.0,
-            'stim_period_s': cfg['stim_period_ms'] / 1000.0,
-            'read_delay_s': cfg['read_delay_ms'] / 1000.0,
-            'settle_s': cfg.get('settle_ms', 5) / 1000.0,
+            'channel': cfg['read_ch'], 'buffer': 'nvbuffer1',
+            'n_points_per_cycle': pts_per_cycle,
+            'n_total': pts_per_cycle * n_cycles,
+            'n_pulses': cfg['n_pulses'],
+            'period_ms': cfg['stim_period_ms'],
+            'min_period_ms': lp['min_period_ms'],
+            'drift_threshold_ms': lp['drift_threshold_ms'],
+            'read_settle_warning': lp['read_settle_warning'],
         }
 
-    a_lp = train_lua_params(train_a_config)
-    b_lp = train_lua_params(train_b_config) if train_b_config else None
+    buffer_map = {'train_a': plan(train_a_config, a_lp, pts_a_per_cycle)}
+    if train_b_config:
+        buffer_map['train_b'] = plan(train_b_config, b_lp, pts_b_per_cycle)
+
+    # Duration the script can really take: a train whose period is below what it
+    # can achieve runs at the hardware limit, not at the requested period.
+    def train_feasible_s(cfg, lp):
+        return (cfg['n_pulses'] * max(cfg['stim_period_ms'], lp['min_period_ms']) / 1000.0
+                + lp['settle_s'])
+    per_cycle_s = train_feasible_s(train_a_config, a_lp)
+    if train_b_config:
+        per_cycle_s += train_feasible_s(train_b_config, b_lp) + inter_train_delay_ms / 1000.0
+    buffer_map['feasible_time_s'] = (per_cycle_s * n_cycles
+                                     + inter_cycle_delay_ms / 1000.0 * (n_cycles - 1) + 0.1)
 
     inter_train_s = inter_train_delay_ms / 1000.0
     inter_cycle_s = inter_cycle_delay_ms / 1000.0
@@ -1080,125 +1431,111 @@ def generate_cycle_lua_script(train_a_config, train_b_config, n_cycles,
     lines.append(f"localnode.linefreq = {int(line_freq_hz)}")
 
     # --- Buffer configuration ---
-    # Uses conditional capacity (matches pulse-read pattern): avoids writing
-    # capacity when buffer is already large enough or in append mode from a
-    # previous run — unconditional writes trigger error -286 on the 2636A.
+    # Buffer capacity is read-only on the 2600 series; only the overflow
+    # behaviour can be set from a script.
     lines.append("")
     lines.append("-- Buffer configuration")
-    if same_buffer:
-        cap = min((pts_a_per_cycle + pts_b_per_cycle) * n_cycles + 100, KEITHLEY_MAX_BUFFER_SIZE)
-        lines.append(f"{a_read}.nvbuffer1.fillmode = {a_read}.FILL_ONCE")
-        lines.append(f"{a_read}.nvbuffer1.clear()")
-        lines.append(f"{a_read}.nvbuffer1.appendmode = 1")
-        lines.append(f"{a_read}.nvbuffer1.collecttimestamps = 1")
-        lines.append(f"{a_read}.nvbuffer1.collectsourcevalues = 0")
-    else:
-        for ch, pts in [(a_read, pts_a_per_cycle * n_cycles), (b_read, pts_b_per_cycle * n_cycles)]:
-            cap = min(pts + 100, KEITHLEY_MAX_BUFFER_SIZE)
-            lines.append(f"{ch}.nvbuffer1.fillmode = {ch}.FILL_ONCE")
-            lines.append(f"{ch}.nvbuffer1.clear()")
-            lines.append(f"{ch}.nvbuffer1.appendmode = 1")
-            lines.append(f"{ch}.nvbuffer1.collecttimestamps = 1")
-            lines.append(f"{ch}.nvbuffer1.collectsourcevalues = 0")
+    for ch in ([a_read] if same_buffer else [a_read, b_read]):
+        lines.append(f"{ch}.nvbuffer1.fillmode = {ch}.FILL_ONCE")
+        lines.append(f"{ch}.nvbuffer1.clear()")
+        lines.append(f"{ch}.nvbuffer1.appendmode = 1")
+        lines.append(f"{ch}.nvbuffer1.collecttimestamps = 1")
+        lines.append(f"{ch}.nvbuffer1.collectsourcevalues = 0")
 
     # --- Channel configuration ---
     lines.append("")
     lines.append("-- Channel configuration")
 
-    configured_channels = set()
-
-    def emit_channel_config(cfg, lp, label):
-        wch = cfg['write_ch']
-        rch = cfg['read_ch']
-
-        if cfg['topology'] == 'single':
-            # Single channel: one SMU does both, configured as voltage source
-            ch = wch  # == rch
-            if ch not in configured_channels:
-                configured_channels.add(ch)
-                lines.append(f"-- {label} single-channel: {ch}")
-                lines.append(f"{ch}.source.func = {ch}.OUTPUT_DCVOLTS")
-                lines.append(f"{ch}.source.rangev = {lp['fixed_v_range']}")
-                lines.append(f"{ch}.source.levelv = 0")
-                lines.append(f"{ch}.source.limiti = {cfg['compliance_A']}")
-                lines.append(f"{ch}.measure.rangei = {lp['fixed_i_range']}")
-                lines.append(f"{ch}.measure.autozero = {ch}.AUTOZERO_OFF")
-                lines.append(f"{ch}.measure.autorangei = {ch}.AUTORANGE_OFF")
-                lines.append(f"{ch}.measure.nplc = {lp['nplc']}")
-                lines.extend(_emit_measurement_state(ch, lp['measure_avg']))
-        else:
-            # Dual channel
-            if wch not in configured_channels:
-                configured_channels.add(wch)
-                lines.append(f"-- {label} write channel: {wch}")
-                if cfg.get('stim_drive_type', 'V') == 'V':
-                    lines.append(f"{wch}.source.func = {wch}.OUTPUT_DCVOLTS")
-                    lines.append(f"{wch}.source.rangev = {lp['fixed_v_range']}")
-                    lines.append(f"{wch}.source.levelv = 0")
-                    lines.append(f"{wch}.source.limiti = {cfg['compliance_A']}")
-                else:
-                    lines.append(f"{wch}.source.func = {wch}.OUTPUT_DCAMPS")
-                    lines.append(f"{wch}.source.rangei = {lp['fixed_i_range']}")
-                    lines.append(f"{wch}.source.leveli = 0")
-                    lines.append(f"{wch}.source.limitv = {lp['fixed_v_range']}")
-            if rch not in configured_channels:
-                configured_channels.add(rch)
-                lines.append(f"-- {label} read channel: {rch}")
-                lines.append(f"{rch}.source.func = {rch}.OUTPUT_DCVOLTS")
-                lines.append(f"{rch}.source.rangev = {lp['fixed_read_v_range']}")
-                lines.append(f"{rch}.source.levelv = {cfg['read_voltage']}")
-                lines.append(f"{rch}.source.limiti = {cfg['compliance_A']}")
-                lines.append(f"{rch}.measure.rangei = {lp['fixed_i_range']}")
-                lines.append(f"{rch}.measure.autozero = {rch}.AUTOZERO_OFF")
-                lines.append(f"{rch}.measure.autorangei = {rch}.AUTORANGE_OFF")
-                lines.append(f"{rch}.measure.nplc = {lp['nplc']}")
-                lines.extend(_emit_measurement_state(rch, lp['measure_avg']))
-
-    # H11: channel configuration is emitted ONCE per channel — the
-    # `configured_channels` guard above — because re-ranging mid-run would
-    # perturb the timing the whole architecture is built to protect. That is
-    # the right call, but it silently discarded the second train's ranges,
+    # H11: channel configuration is emitted ONCE per channel and role-group —
+    # re-ranging mid-run would perturb the timing the whole architecture is
+    # built to protect. That silently discarded the second train's ranges,
     # compliance and filter whenever the two trains shared a channel: Train A
     # at 1.0 V followed by Train B at 15 V on the same SMU left Train B
     # clipping at the 2 V range with no error anywhere.
     #
     # Sharing a channel is legitimate; sharing it with INCOMPATIBLE settings is
     # not, and cannot be honoured without re-ranging. So it is rejected here
-    # rather than silently mis-measured.
-    if train_b_config:
-        shared = {train_a_config.get('write_ch'), train_a_config.get('read_ch')} & \
-                 {train_b_config.get('write_ch'), train_b_config.get('read_ch')}
-        shared.discard(None)
-        if shared:
-            conflicts = []
-            if a_lp['fixed_v_range'] != b_lp['fixed_v_range']:
-                conflicts.append(
-                    f"source voltage range ({a_lp['fixed_v_range']} V vs "
-                    f"{b_lp['fixed_v_range']} V)")
-            if a_lp['fixed_i_range'] != b_lp['fixed_i_range']:
-                conflicts.append(
-                    f"current measure range ({a_lp['fixed_i_range']} A vs "
-                    f"{b_lp['fixed_i_range']} A)")
-            if train_a_config['compliance_A'] != train_b_config['compliance_A']:
-                conflicts.append(
-                    f"compliance ({train_a_config['compliance_A']} A vs "
-                    f"{train_b_config['compliance_A']} A)")
-            if a_lp['nplc'] != b_lp['nplc']:
-                conflicts.append(f"NPLC ({a_lp['nplc']} vs {b_lp['nplc']})")
-            if a_lp['measure_avg'] != b_lp['measure_avg']:
-                conflicts.append(
-                    f"averaging ({a_lp['measure_avg']} vs {b_lp['measure_avg']})")
+    # rather than silently mis-measured. The comparison is per CHANNEL and per
+    # setting the two trains both need — not only the write range: trains with
+    # swapped roles (A writes smua / reads smub, B writes smub / reads smua)
+    # configured smub's source range once for the 0.2 V read role and then had B
+    # write -1 V into it.
+    def requirements(cfg, lp):
+        w, r = cfg['write_ch'], cfg['read_ch']
+        read_req = {'measure.rangei': lp['fixed_i_range'], 'nplc': lp['nplc'],
+                    'measure_avg': lp['measure_avg']}
 
-            if conflicts:
-                raise ValueError(
-                    "Train A and Train B share SMU channel(s) "
-                    f"{', '.join(sorted(shared))} but require different "
-                    "settings:\n  - " + "\n  - ".join(conflicts) + "\n\n"
-                    "A channel is configured once, before the run, because "
-                    "re-ranging mid-sequence would corrupt the pulse timing. "
-                    "Either give the trains compatible settings, or put them "
-                    "on separate channels."
-                )
+        def volts(rng):
+            return {'source.func': 'DCVOLTS', 'source.rangev': rng,
+                    'source.limiti': cfg['compliance_A']}
+        if cfg['topology'] == 'single':
+            return {w: {**volts(lp['write_v_range']), **read_req}}
+        if cfg.get('stim_drive_type', 'V') == 'V':
+            write_req = volts(lp['write_v_range'])
+        else:
+            write_req = {'source.func': 'DCAMPS', 'source.rangei': lp['write_i_range'],
+                         'source.limitv': lp['v_limit']}
+        return {w: write_req, r: {**volts(lp['read_v_range']), **read_req}}
+
+    if train_b_config:
+        a_req = requirements(train_a_config, a_lp)
+        b_req = requirements(train_b_config, b_lp)
+        shared = sorted(set(a_req) & set(b_req))
+        conflicts = [
+            f"{ch} {key} ({a_req[ch][key]} vs {b_req[ch][key]})"
+            for ch in shared
+            for key in sorted(set(a_req[ch]) & set(b_req[ch]))
+            if a_req[ch][key] != b_req[ch][key]
+        ]
+        if conflicts:
+            raise ValueError(
+                "Train A and Train B share SMU channel(s) "
+                f"{', '.join(shared)} but require different "
+                "settings:\n  - " + "\n  - ".join(conflicts) + "\n\n"
+                "A channel is configured once, before the run, because "
+                "re-ranging mid-sequence would corrupt the pulse timing. "
+                "Either give the trains compatible settings, or put them "
+                "on separate channels."
+            )
+
+    emitted = set()
+
+    def emit_group(ch, group, group_lines):
+        if (ch, group) not in emitted:
+            emitted.add((ch, group))
+            lines.extend(group_lines)
+
+    def volts_group(ch, cfg, rng, level):
+        return [f"{ch}.source.func = {ch}.OUTPUT_DCVOLTS",
+                f"{ch}.source.rangev = {rng}",
+                f"{ch}.source.levelv = {level}",
+                f"{ch}.source.limiti = {cfg['compliance_A']}"]
+
+    def measure_group(ch, lp):
+        # The ADC state is fixed completely here, once per read channel: delay
+        # off, NPLC, count/filter and AUTOZERO_ONCE (see _emit_read_adc_setup).
+        return [f"{ch}.measure.rangei = {lp['fixed_i_range']}",
+                f"{ch}.measure.autorangei = {ch}.AUTORANGE_OFF"
+                ] + _emit_read_adc_setup(ch, lp['nplc'], lp['measure_avg'])
+
+    def emit_channel_config(cfg, lp, label):
+        wch, rch = cfg['write_ch'], cfg['read_ch']
+        if cfg['topology'] == 'single':
+            lines.append(f"-- {label} single-channel: {wch}")
+            emit_group(wch, 'volts', volts_group(wch, cfg, lp['write_v_range'], 0))
+            emit_group(wch, 'measure', measure_group(wch, lp))
+        else:
+            lines.append(f"-- {label} write channel: {wch}, read channel: {rch}")
+            if cfg.get('stim_drive_type', 'V') == 'V':
+                emit_group(wch, 'volts', volts_group(wch, cfg, lp['write_v_range'], 0))
+            else:
+                emit_group(wch, 'amps', [
+                    f"{wch}.source.func = {wch}.OUTPUT_DCAMPS",
+                    f"{wch}.source.rangei = {lp['write_i_range']}",
+                    f"{wch}.source.leveli = 0",
+                    f"{wch}.source.limitv = {lp['v_limit']}"])
+            emit_group(rch, 'volts', volts_group(rch, cfg, lp['read_v_range'], cfg['read_voltage']))
+            emit_group(rch, 'measure', measure_group(rch, lp))
 
     emit_channel_config(train_a_config, a_lp, "Train A")
     if train_b_config:
@@ -1215,97 +1552,108 @@ def generate_cycle_lua_script(train_a_config, train_b_config, n_cycles,
     lines.append("")
     lines.append("-- Main cycle loop")
     lines.append("timer.reset()")
+    # t_abs is the monotonic script-time deadline of the current gap. Each train
+    # sets it to the time it ACTUALLY ended, so the inter-train and inter-cycle
+    # delays are measured from there: carrying the nominal schedule forward let
+    # an overrunning train eat its following 500 ms delay down to 74 ms.
     lines.append("local t_abs = 0")
+    lines.append("local a_overruns, a_worst = 0, 0")
+    if train_b_config:
+        lines.append("local b_overruns, b_worst = 0, 0")
     lines.append("")
     lines.append(f"for cycle = 1, {n_cycles} do")
 
-    def emit_train_block(cfg, lp, label, indent="    "):
+    def emit_train_block(cfg, lp, label, tag, indent="    "):
         rch = cfg['read_ch']
         wch = cfg['write_ch']
         n = cfg['n_pulses']
-        period_s = lp['stim_period_s']
+        single = cfg['topology'] == 'single'
+        lvl = 'levelv' if cfg.get('stim_drive_type', 'V') == 'V' else 'leveli'
 
-        lines.append(f"")
+        def dly(seconds, name, extra=""):
+            d = lua_delay(seconds, name)   # delay(0) aborts a 2600 script
+            if d:
+                lines.append(f"{indent}{extra}{d}")
+
+        lines.append("")
         lines.append(f"{indent}-- === {label}: {cfg['topology']} channel, {n} pulses ===")
 
-        # Reconfigure NPLC if needed (fast register write, no relay)
-        lines.append(f"{indent}{rch}.measure.nplc = {lp['nplc']}")
-
-        if cfg['topology'] == 'single':
-            # Set channel to read voltage for initial read
+        # Initial (pre-stimulus baseline) read
+        if single:
             lines.append(f"{indent}{wch}.source.levelv = {cfg['read_voltage']}")
-            lines.append(f"{indent}delay({lp['settle_s']})")
-        elif cfg['topology'] == 'dual':
-            # Ensure read channel is at read voltage, write channel idle
+        else:
+            # Read channel at its constant bias, write channel idle
             lines.append(f"{indent}{rch}.source.levelv = {cfg['read_voltage']}")
-            if cfg.get('stim_drive_type', 'V') == 'V':
-                lines.append(f"{indent}{wch}.source.levelv = 0")
-            else:
-                lines.append(f"{indent}{wch}.source.leveli = 0")
-            lines.append(f"{indent}delay({lp['settle_s']})")
-
-        # Initial read
+            lines.append(f"{indent}{wch}.source.{lvl} = 0")
+        dly(lp['settle_s'], "settle_ms")
         lines.append(f"{indent}{rch}.measure.i({rch}.nvbuffer1)")
+        if single:
+            lines.append(f"{indent}{wch}.source.levelv = 0")
 
-        # Pulse loop
-        lines.append(f"{indent}local t_train_start = t_abs")
+        # The train's time base is taken AFTER the baseline read, as pulse-read
+        # does. Taking it before the settle and the read made the first interval
+        # of every train shorter by the duration of that read (~7 ms: 42.85 ms
+        # delivered for a 50 ms period).
+        lines.append(f"{indent}local t_next = timer.measure.t()")
         lines.append(f"{indent}for pulse = 1, {n} do")
-        lines.append(f"{indent}    t_abs = t_train_start + pulse * {period_s}")
+        lines.append(f"{indent}    t_next = t_next + {lp['stim_period_s']}")
 
-        if cfg['topology'] == 'single':
-            # Write pulse then read pulse on same channel
+        if single:
+            # Write, raise the line to the read voltage for read_delay + the ADC,
+            # then back to 0 V. It used to sit at the read voltage for the rest
+            # of the period, i.e. continuous read disturb between pulses.
             lines.append(f"{indent}    {wch}.source.levelv = {cfg['stim_level']}")
-            lines.append(f"{indent}    delay({lp['stim_width_s']})")
+            dly(lp['stim_width_s'], "stim_width_ms", "    ")
             lines.append(f"{indent}    {wch}.source.levelv = {cfg['read_voltage']}")
-            lines.append(f"{indent}    delay({lp['read_delay_s']})")
+            dly(lp['read_delay_s'], "read_delay_ms", "    ")
             lines.append(f"{indent}    {rch}.measure.i({rch}.nvbuffer1)")
-        elif cfg['topology'] == 'dual':
-            if cfg.get('stim_drive_type', 'V') == 'V':
-                lines.append(f"{indent}    {wch}.source.levelv = {cfg['stim_level']}")
-                lines.append(f"{indent}    delay({lp['stim_width_s']})")
-                lines.append(f"{indent}    {wch}.source.levelv = 0")
-            else:
-                lines.append(f"{indent}    {wch}.source.leveli = {cfg['stim_level']}")
-                lines.append(f"{indent}    delay({lp['stim_width_s']})")
-                lines.append(f"{indent}    {wch}.source.leveli = 0")
-            lines.append(f"{indent}    delay({lp['read_delay_s']})")
+            lines.append(f"{indent}    {wch}.source.levelv = 0")
+        else:
+            lines.append(f"{indent}    {wch}.source.{lvl} = {cfg['stim_level']}")
+            dly(lp['stim_width_s'], "stim_width_ms", "    ")
+            lines.append(f"{indent}    {wch}.source.{lvl} = 0")
+            dly(lp['read_delay_s'], "read_delay_ms", "    ")
             lines.append(f"{indent}    {rch}.measure.i({rch}.nvbuffer1)")
 
-        # Timer-based period enforcement
-        lines.append(f"{indent}    local t_remain = t_abs - timer.measure.t()")
-        lines.append(f"{indent}    if t_remain > 0 then delay(t_remain) end")
+        # Timer-based period enforcement. A pulse whose own work outlasted the
+        # period has no remainder: it is counted and reported (SYN_TIMING), and
+        # t_next is re-baselined to now so one slow pulse neither flags every
+        # later pulse nor makes the loop fire back-to-back to catch up.
+        lines.append(f"{indent}    local t_remain = t_next - timer.measure.t()")
+        lines.append(f"{indent}    if t_remain > 0 then")
+        lines.append(f"{indent}        delay(t_remain)")
+        lines.append(f"{indent}    else")
+        lines.append(f"{indent}        {tag}_overruns = {tag}_overruns + 1")
+        lines.append(f"{indent}        if -t_remain > {tag}_worst then {tag}_worst = -t_remain end")
+        lines.append(f"{indent}        t_next = timer.measure.t()")
+        lines.append(f"{indent}    end")
         lines.append(f"{indent}end")
 
         # Return channel to safe idle after train
-        if cfg['topology'] == 'single':
-            lines.append(f"{indent}{wch}.source.levelv = 0")
-        elif cfg['topology'] == 'dual':
-            if cfg.get('stim_drive_type', 'V') == 'V':
-                lines.append(f"{indent}{wch}.source.levelv = 0")
-            else:
-                lines.append(f"{indent}{wch}.source.leveli = 0")
+        lines.append(f"{indent}{wch}.source.{lvl} = 0")
+        lines.append(f"{indent}t_abs = timer.measure.t()")
 
     # Train A
-    emit_train_block(train_a_config, a_lp, "TRAIN A")
+    emit_train_block(train_a_config, a_lp, "TRAIN A", "a")
 
     # Inter-train delay + Train B
     if train_b_config:
         lines.append("")
-        lines.append(f"    -- Inter-train delay")
+        lines.append("    -- Inter-train delay, from the actual end of Train A")
         lines.append(f"    t_abs = t_abs + {inter_train_s}")
-        lines.append(f"    local t_wait_train = t_abs - timer.measure.t()")
-        lines.append(f"    if t_wait_train > 0 then delay(t_wait_train) end")
+        lines.append("    local t_wait_train = t_abs - timer.measure.t()")
+        lines.append("    if t_wait_train > 0 then delay(t_wait_train) end")
 
-        emit_train_block(train_b_config, b_lp, "TRAIN B")
+        emit_train_block(train_b_config, b_lp, "TRAIN B", "b")
 
     # Inter-cycle delay
     lines.append("")
-    lines.append(f"    -- Inter-cycle delay")
+    lines.append("    -- Inter-cycle delay, from the actual end of the last train")
     lines.append(f"    if cycle < {n_cycles} then")
     lines.append(f"        t_abs = t_abs + {inter_cycle_s}")
-    lines.append(f"        local t_wait_cycle = t_abs - timer.measure.t()")
-    lines.append(f"        if t_wait_cycle > 0 then delay(t_wait_cycle) end")
-    lines.append(f"    end")
+    lines.append("        local t_wait_cycle = t_abs - timer.measure.t()")
+    lines.append("        if t_wait_cycle > 0 then delay(t_wait_cycle) end")
+    lines.append("    end")
 
     lines.append("end")
 
@@ -1315,25 +1663,37 @@ def generate_cycle_lua_script(train_a_config, train_b_config, n_cycles,
     for ch in sorted(channels_used):
         lines.append(f"{ch}.source.output = {ch}.OUTPUT_OFF")
         lines.append(f"{ch}.measure.filter.enable = {ch}.FILTER_OFF")
+        if (ch, 'measure') in emitted:
+            lines.extend(_emit_restore_adc(ch))   # put back delay/autozero for later J-V runs
+
+    # Timing report, one aggregated line with per-train fields (the host merges
+    # every SYN_TIMING line into one dict, so per-train lines would overwrite
+    # each other). Printed before the completion token.
+    fields = "a_overruns=%d a_worst_ms=%.4f a_n_pulses=%d"
+    args = f"a_overruns, a_worst * 1000, {train_a_config['n_pulses'] * n_cycles}"
+    if train_b_config:
+        fields += " b_overruns=%d b_worst_ms=%.4f b_n_pulses=%d"
+        args += f", b_overruns, b_worst * 1000, {train_b_config['n_pulses'] * n_cycles}"
+    lines.append("")
+    lines.append(f'print(string.format("{LUA_TIMING_TOKEN} {fields}", {args}))')
 
     # Completion token (host reads this to detect script end)
-    lines.append("")
     lines.append(f'print("{LUA_DONE_TOKEN}")')
 
     lua_script = '\n'.join(lines) + '\n'
 
     # --- Timing validation (warn but don't block) ---
-    NPLC_PERIOD_MS = 1000.0 / line_freq_hz
     for cfg, lp, label in [(train_a_config, a_lp, "Train A")] + \
             ([(train_b_config, b_lp, "Train B")] if train_b_config else []):
-        meas_time_ms = lp['nplc'] * NPLC_PERIOD_MS * (lp['measure_avg'] if lp['measure_avg'] > 1 else 1)
-        min_period = cfg['stim_width_ms'] + cfg['read_delay_ms'] + meas_time_ms + cfg.get('settle_ms', 5)
-        if cfg['stim_period_ms'] < min_period:
+        if cfg['stim_period_ms'] < lp['min_period_ms']:
             print(f"⚠️  {label}: Requested period ({cfg['stim_period_ms']:.1f} ms) shorter than minimum "
-                  f"({min_period:.1f} ms). Instrument will run as fast as possible.")
+                  f"({lp['min_period_ms']:.1f} ms = write {cfg['stim_width_ms']:g} + read_delay "
+                  f"{cfg['read_delay_ms']:g} + measure {lp['meas_time_ms']:.2f}, before TSP command "
+                  f"latency). Instrument will run as fast as possible.")
+        if lp['read_settle_warning']:
+            print(f"⚠️  {label}: {lp['read_settle_warning']}")
 
     return lua_script, buffer_map
-
 
 # =============================================================================
 # SAFE STATE — CALLED BEFORE EVERY SCRIPT UPLOAD
@@ -1346,11 +1706,12 @@ def _safe_state(instrument):
     Called before every loadandrunscript to ensure the instrument is not
     stimulating the DUT during script upload.
 
-    IMPORTANT: Does NOT toggle OUTPUT_ON/OUTPUT_OFF relays.
-    - OUTPUT_OFF disconnects the output (high impedance), leaving external
-      circuits floating — LEDs stay lit from stored charge, capacitors
-      hold voltage.  The subsequent OUTPUT_ON in the script causes another
-      relay toggle, compounding the problem.
+    IMPORTANT: Does NOT toggle OUTPUT_ON/OUTPUT_OFF.
+    - With the default offmode NORMAL, OUTPUT_OFF does NOT open the relay: the
+      output is held at 0 V behind a 1 mA off-limit (RM 2-77) — it is not high
+      impedance (that needs offmode HIGH_Z). So switching it here neither
+      isolates the DUT nor is it "safer" than a 0 V level; it is a pointless
+      transition that the script's OUTPUT_ON would then reverse.
     - Instead, just drive the source level to 0 V.  If the output was ON,
       the DUT is actively driven to 0 V (safe).  If the output was OFF,
       levelv has no external effect (also safe).
@@ -1364,12 +1725,14 @@ def _safe_state(instrument):
 # CYCLE-SPECIFIC LUA EXECUTION AND BUFFER RETRIEVAL
 # =============================================================================
 
-def _upload_and_execute_lua(instrument, lua_script, expected_time_s=None):
+def _upload_lua(instrument, lua_script):
     """
-    Uploads and executes a LUA script via anonymous loadandrunscript.
-    Waits for completion on LUA_DONE_TOKEN emitted by the script.
-    Does NOT retrieve any buffer data — caller handles retrieval.
+    Uploads a script via anonymous loadandrunscript, WITHOUT starting it.
+    Nothing has run on the instrument when this returns or raises, so a failure
+    here is the only point at which a caller may still choose another path.
     """
+    # A token left from an earlier run would otherwise end the wait below at once.
+    _drain_output(instrument)
     _safe_state(instrument)
     instrument.write("loadandrunscript")
     time.sleep(0.02)
@@ -1391,19 +1754,96 @@ def _upload_and_execute_lua(instrument, lua_script, expected_time_s=None):
     if chunk:
         instrument.write('\n'.join(chunk))
 
-    # Trigger execution
-    instrument.write("endscript")
 
-    # Wait for the TSP-native completion token emitted as the script's
-    # final statement. See _wait_lua_complete() for rationale.
+def _run_uploaded_lua(instrument, expected_time_s=None):
+    """
+    Starts the uploaded script (endscript) and waits for LUA_DONE_TOKEN, which
+    every generated script emits as its final statement. Returns the dict of
+    SYN_TIMING fields the script reported.
+
+    No sleep-based fallback: a token that does not arrive means the script did
+    not finish (a mid-script TSP error aborts it; the instrument's error queue
+    then says why), and carrying on as if it had is how a dead run was reported
+    as complete. Raises LuaExecutionError; the caller owns the cleanup.
+    """
+    instrument.write("endscript")
     try:
-        _wait_lua_complete(instrument, expected_time_s)
-    except Exception:
-        # Fallback: sleep-based wait (only fires if the token never arrives,
-        # e.g. VISA disruption — normal runs always receive the token).
-        wait_time = expected_time_s if expected_time_s else 60
-        print(f"  [LUA] completion token not received, waiting {wait_time*1.2:.1f}s...")
-        time.sleep(wait_time * 1.2)
+        return _wait_lua_complete(instrument, expected_time_s) or {}
+    except Exception as e:
+        raise LuaExecutionError(
+            f"completion token not received within the timeout ({e!r})") from e
+
+
+def _upload_and_execute_lua(instrument, lua_script, expected_time_s=None):
+    """
+    Uploads and executes a LUA script via anonymous loadandrunscript and waits
+    for the completion token. Does NOT retrieve any buffer data.
+
+    Returns the SYN_TIMING statistics the script printed; raises
+    LuaExecutionError if the token never arrives.
+    """
+    _upload_lua(instrument, lua_script)
+    return _run_uploaded_lua(instrument, expected_time_s)
+
+
+def _outputs_off(instrument):
+    """Both SMU outputs OFF. Returns None, or a description of why it failed."""
+    try:
+        instrument.write("smua.source.output = smua.OUTPUT_OFF")
+        instrument.write("smub.source.output = smub.OUTPUT_OFF")
+    except Exception as e:
+        return f"COULD NOT SWITCH THE OUTPUTS OFF ({e!r}) - check the instrument front panel"
+    return None
+
+
+def _read_error_queue(instrument, limit=20):
+    """Entries of the instrument error queue (cleared as they are read).
+
+    An unreadable queue is returned as an entry saying so, never as an empty
+    list: "we could not look" must not read as "there was nothing there".
+    """
+    try:
+        count = int(float(instrument.query("print(errorqueue.count)").strip()))
+        entries = [instrument.query('print(errorqueue.next())').strip()
+                   for _ in range(min(limit, count))]
+        if count:
+            instrument.write("errorqueue.clear()")
+        if count > limit:
+            entries.append(f"... and {count - limit} more")
+        return entries
+    except Exception as e:
+        return [f"error queue unreadable: {e!r}"]
+
+
+def _cycle_fault(instrument, buffer_map, reason, errors=None):
+    """Make a failed cycle run safe and build the exception that reports it.
+
+    After a mid-script TSP error the outputs were left ON at the read voltage
+    and the caller printed "[OK] Cycle sequence complete" with nothing parsed.
+    The outputs go OFF first; the buffer counts and the error queue are then
+    attached so the failure is diagnosable. The caller raises the result.
+    """
+    off_problem = _outputs_off(instrument)
+    expected = {}
+    for key in ('train_a', 'train_b'):
+        info = buffer_map.get(key)
+        if info:
+            expected[info['channel']] = expected.get(info['channel'], 0) + info['n_total']
+    counts = {}
+    for ch, exp in expected.items():
+        try:
+            held = int(float(instrument.query(f"print({ch}.nvbuffer1.n)").strip()))
+            counts[ch] = f"{held}/{exp}"
+        except Exception as e:
+            counts[ch] = f"unreadable ({e!r})/{exp}"
+    if errors is None:
+        errors = _read_error_queue(instrument)
+    msg = (f"Cycle sequence FAILED: {reason}.\n"
+           f"  Outputs: {off_problem or 'switched OFF'}\n"
+           f"  Buffer points held/expected: {counts}\n"
+           f"  Instrument error queue: {errors if errors else 'empty'}\n"
+           "  No data was returned; the sequence is NOT complete.")
+    return LuaExecutionError(msg, counts, errors)
 
 
 def _retrieve_buffer(instrument, channel, n_points):
@@ -1412,20 +1852,24 @@ def _retrieve_buffer(instrument, channel, n_points):
     Uses chunked printbuffer (500 pts/read) to avoid VISA overflow.
     Queries actual buffer count first to avoid error 5038 (index exceeds maximum).
 
+    Raises LuaExecutionError if the count cannot be read: requesting the
+    expected number of points from a buffer that may hold fewer is error 5038
+    at best, and misaligned data at worst.
+
     Returns:
         tuple: (timestamps: list[float], currents: list[float])
     """
     CHUNK = 500
     buf = f"{channel}.nvbuffer1"
 
-    # Query actual number of readings in buffer (prevents overread)
-    actual_n = n_points
     try:
         actual_n = int(float(instrument.query(f"print({buf}.n)").strip()))
-        if actual_n < n_points:
-            print(f"WARNING: {channel} buffer has {actual_n}/{n_points} expected points")
-    except Exception:
-        pass
+    except Exception as e:
+        raise LuaExecutionError(
+            f"could not read the {channel} buffer count ({e!r}); not assuming "
+            f"the expected {n_points} points are there") from e
+    if actual_n < n_points:
+        print(f"WARNING: {channel} buffer has {actual_n}/{n_points} expected points")
 
     all_currents = []
     all_timestamps = []
@@ -1440,6 +1884,93 @@ def _retrieve_buffer(instrument, channel, n_points):
     return all_timestamps, all_currents
 
 
+def _analyse_cycle_timing(result, buffer_map, lua_stats):
+    """Per-train timing record of a cycle run, from the buffer timestamps.
+
+    Each train block of each cycle is analysed on its own, against that train's
+    requested period. The baseline->pulse-1 interval is not a pulse period and
+    the inter-train / inter-cycle gaps lie BETWEEN blocks, so neither enters.
+    (The previous analysis took the median over every consecutive pair in the
+    buffer and reported the gaps as "+3465 ms drift".) An analysis that cannot
+    run is recorded as such; it never reads as "no drift".
+    """
+    timing = {'instrument_report': dict(lua_stats) if lua_stats else
+              {'status': 'unavailable', 'reason': 'script emitted no SYN_TIMING line'}}
+    a_info = buffer_map['train_a']
+    b_info = buffer_map.get('train_b')
+    shared = b_info is not None and b_info['channel'] == a_info['channel']
+    stride_shared = a_info['n_points_per_cycle'] + (b_info['n_points_per_cycle'] if shared else 0)
+    layout = [('train_a', 'Train A', 'a', a_info, 'train_a', 0,
+               stride_shared if shared else a_info['n_points_per_cycle'])]
+    if b_info is not None:
+        layout.append(('train_b', 'Train B', 'b', b_info,
+                       'train_a' if shared else 'train_b',
+                       a_info['n_points_per_cycle'] if shared else 0,
+                       stride_shared if shared else b_info['n_points_per_cycle']))
+
+    for key, label, tag, info, data_key, base, stride in layout:
+        try:
+            ts = result[data_key]['timestamps']
+            n = info['n_pulses']
+            req_ms = info['period_ms']
+            thr_ms = info['drift_threshold_ms']
+            periods_ms = []
+            n_blocks = 0
+            while base + n_blocks * stride + n + 1 <= len(ts):
+                blk = ts[base + n_blocks * stride: base + n_blocks * stride + n + 1]
+                periods_ms.extend((blk[k + 1] - blk[k]) * 1000.0 for k in range(1, n))
+                n_blocks += 1
+            if not periods_ms:
+                rec = {'status': 'no_intervals', 'n_blocks': n_blocks,
+                       'reason': 'fewer than two pulses per block or no complete block'}
+            else:
+                dev = np.asarray(periods_ms) - req_ms
+                rec = {
+                    'status': 'ok',
+                    'requested_period_ms': req_ms,
+                    'delivered_period_ms_median': float(np.median(periods_ms)),
+                    'max_late_ms': float(max(dev.max(), 0.0)),
+                    'max_early_ms': float(max(-dev.min(), 0.0)),
+                    'threshold_ms': thr_ms,
+                    'n_intervals': len(periods_ms),
+                    'n_intervals_exceeding_threshold': int(np.sum(np.abs(dev) > thr_ms)),
+                    'n_blocks': n_blocks,
+                }
+                if rec['n_intervals_exceeding_threshold']:
+                    print(f"⚠️  {label}: {rec['n_intervals_exceeding_threshold']}/{len(periods_ms)} "
+                          f"pulse intervals off the requested {req_ms:g} ms by more than "
+                          f"{thr_ms:.2f} ms (worst: +{rec['max_late_ms']:.2f} / "
+                          f"-{rec['max_early_ms']:.2f} ms)")
+        except Exception as e:
+            rec = {'status': 'analysis_failed', 'error': repr(e)}
+            print(f"⚠️  {label}: timing analysis FAILED ({e!r}). Timing quality is "
+                  "UNKNOWN for this train - the absence of a drift warning does NOT "
+                  "mean the timing was good.")
+        n_over = lua_stats.get(f'{tag}_overruns') if lua_stats else None
+        if isinstance(n_over, float):
+            rec['instrument_overruns'] = int(n_over)
+            rec['instrument_worst_overrun_ms'] = lua_stats.get(f'{tag}_worst_ms')
+            if n_over > 0:
+                print(f"⚠️  {label}: {int(n_over)} pulse(s) could NOT meet the requested period "
+                      f"(worst shortfall {lua_stats.get(f'{tag}_worst_ms', float('nan')):.3f} ms). "
+                      "The train ran at the hardware limit there; use the buffer timestamps, "
+                      "not the nominal period.")
+        rec['min_period_ms'] = info['min_period_ms']
+        # Same contract as pulse-read's timing record, which the GUI reads:
+        # `settle_warning`, and `period_delivered` True / False / None
+        # (None = could not be verified, never assumed True).
+        rec['settle_warning'] = info['read_settle_warning']
+        if 'instrument_overruns' in rec and rec.get('status') == 'ok':
+            rec['period_delivered'] = (rec['instrument_overruns'] == 0
+                                       and rec['n_intervals_exceeding_threshold'] == 0)
+        elif rec.get('instrument_overruns'):
+            rec['period_delivered'] = False
+        else:
+            rec['period_delivered'] = None
+        timing[key] = rec
+    return timing
+
+
 def execute_cycle_lua(instrument, lua_script, buffer_map, expected_time_s):
     """
     Executes a cycle LUA script and retrieves data from one or two buffers.
@@ -1448,14 +1979,36 @@ def execute_cycle_lua(instrument, lua_script, buffer_map, expected_time_s):
         instrument: PyVISA resource
         lua_script (str): The cycle LUA script
         buffer_map (dict): Output from generate_cycle_lua_script
-        expected_time_s (float): Expected execution time
+        expected_time_s (float): Expected execution time at the requested periods
 
     Returns:
         dict: {'train_a': {'timestamps': [...], 'currents': [...]},
-               'train_b': {'timestamps': [...], 'currents': [...]} }
+               'train_b': {...},
+               'timing': per-train timing record (see _analyse_cycle_timing)}
+
+    Raises:
+        LuaExecutionError: the completion token did not arrive, or the
+            instrument reported any error. The outputs are switched OFF first.
     """
     try:
-        _upload_and_execute_lua(instrument, lua_script, expected_time_s)
+        # The timeout follows the duration the script can really take: trains
+        # whose period is below what they can achieve run longer than requested.
+        timeout_basis_s = max(expected_time_s or 0.0, buffer_map.get('feasible_time_s') or 0.0)
+        try:
+            lua_stats = _upload_and_execute_lua(instrument, lua_script, timeout_basis_s)
+        except LuaExecutionError as e:
+            raise _cycle_fault(instrument, buffer_map, str(e)) from e
+
+        # Errors first, before any data is trusted: a range or attribute write
+        # the instrument rejected leaves the script RUNNING on the wrong setting.
+        errors = _read_error_queue(instrument)
+        if errors:
+            raise _cycle_fault(instrument, buffer_map,
+                               "the instrument reported error(s) during the script",
+                               errors=errors)
+
+        # 15 digits: the default 6 quantises timestamps beyond 100 s.
+        _set_ascii_precision(instrument)
 
         result = {}
 
@@ -1472,75 +2025,58 @@ def execute_cycle_lua(instrument, lua_script, buffer_map, expected_time_s):
                 result['train_b'] = {'timestamps': b_ts, 'currents': b_curr}
             # If same channel, Train B data is interleaved in train_a's buffer (parsed later)
 
-        # Per-pulse timing drift analysis from buffer timestamps
-        for train_key, train_label in [('train_a', 'Train A'), ('train_b', 'Train B')]:
-            if train_key not in result:
-                continue
-            ts = result[train_key]['timestamps']
-            if len(ts) < 3:
-                continue
-            # Determine expected period from buffer_map
-            bm = buffer_map.get(train_key, buffer_map.get('train_a'))
-            n_pts = bm['n_points_per_cycle']
-            if n_pts < 2:
-                continue
-            # Expected period: total points per train per cycle = n_pulses + 1 (initial read)
-            # Consecutive deltas within each cycle's train block
-            try:
-                drifts_ms = [
-                    (ts[i+1] - ts[i]) for i in range(len(ts) - 1)
-                ]
-                # Median period as reference (robust against outliers at train boundaries)
-                median_period = float(np.median(drifts_ms))
-                deviations = [(i+1, (d - median_period) * 1000.0) for i, d in enumerate(drifts_ms)]
-                drifted = [(pulse, dev) for pulse, dev in deviations if dev > 0.5]
-                if drifted:
-                    total_drift = sum(d for _, d in drifted)
-                    worst_pulse, worst_ms = max(drifted, key=lambda x: x[1])
-                    print(f"⚠️  {train_label} timing drift: +{total_drift:.1f} ms total")
-                    if len(drifted) <= 5:
-                        for pulse_num, d in drifted:
-                            print(f"   Point {pulse_num}: +{d:.1f} ms")
-                    else:
-                        print(f"   {len(drifted)}/{len(drifts_ms)} intervals drifted >0.5 ms "
-                              f"(worst: point {worst_pulse} at +{worst_ms:.1f} ms)")
-            except Exception:
-                pass
+        result['timing'] = _analyse_cycle_timing(result, buffer_map, lua_stats)
 
         # Clear buffers
         instrument.write(f"{a_info['channel']}.nvbuffer1.clear()")
         if 'train_b' in buffer_map and buffer_map['train_b']['channel'] != a_info['channel']:
             instrument.write(f"{buffer_map['train_b']['channel']}.nvbuffer1.clear()")
 
-        # Check error queue
-        try:
-            err_cnt = int(float(instrument.query("print(errorqueue.count)").strip()))
-            if err_cnt > 0:
-                print(f"⚠️  {err_cnt} instrument error(s) during cycle execution:")
-                for _ in range(min(5, err_cnt)):
-                    print(f"   {instrument.query('print(errorqueue.next())').strip()}")
-                instrument.write("errorqueue.clear()")
-        except Exception:
-            pass
-
         return result
 
-    except Exception as e:
-        try:
-            instrument.write("smua.source.output = smua.OUTPUT_OFF")
-            instrument.write("smub.source.output = smub.OUTPUT_OFF")
-        except Exception:
-            pass
-        raise e
-
+    except Exception:
+        problem = _outputs_off(instrument)
+        if problem:
+            print(f"⚠️  {problem}")
+        raise
 
 # =============================================================================
 # FAST LUA EXECUTION FOR SYNAPSE CHARACTERIZATION (EXISTING)
 # =============================================================================
 
+def _abort_outputs(instrument):
+    """Best-effort safe shutdown: levels to 0 BEFORE the outputs go off."""
+    try:
+        for ch in ('smua', 'smub'):
+            instrument.write(f"{ch}.source.levelv = 0")
+            instrument.write(f"{ch}.source.leveli = 0")
+        for ch in ('smua', 'smub'):
+            instrument.write(f"{ch}.source.output = {ch}.OUTPUT_OFF")
+    except Exception:
+        pass
+
+
+def _script_fault_report(instrument, read_ch):
+    """Buffer point count reached and the instrument error queue, after a fault."""
+    try:
+        reached = int(float(instrument.query(f"print({read_ch}.nvbuffer1.n)").strip()))
+    except Exception as e:
+        reached = f"unknown ({e!r})"
+    errs = []
+    try:
+        count = int(float(instrument.query("print(errorqueue.count)").strip()))
+        for _ in range(min(10, count)):
+            errs.append(instrument.query("print(errorqueue.next())").strip())
+    except Exception as e:
+        errs.append(f"error queue unreadable: {e!r}")
+    return reached, errs
+
+
 def execute_lua_script_fast(instrument, lua_script, read_ch, n_expected_points,
                             expected_time_s=None, min_event_ms=None,
-                            timing_out=None):
+                            timing_out=None, analysis='pulse_read',
+                            requested_period_s=None, feasible_time_s=None,
+                            n_is_exact=False):
     """
     Uploads and executes LUA script with 'Safe Delete' to prevent Error -292.
 
@@ -1552,11 +2088,32 @@ def execute_lua_script_fast(instrument, lua_script, read_ch, n_expected_points,
         lua_script (str): LUA script to upload and execute
         read_ch (str): Read channel name for buffer retrieval
         n_expected_points (int): Expected number of buffer data points
-        expected_time_s (float, optional): Expected execution time in seconds.
-            Used for timeout calculation and sleep-based fallback when OPC fails.
-            If None, a conservative default is used.
+        expected_time_s (float, optional): REQUESTED duration in seconds. The
+            requested period for drift analysis is derived from it.
+        feasible_time_s (float, optional): duration the instrument can actually
+            deliver (>= expected_time_s when the requested period is infeasible).
+            Sets the completion timeout and the sleep fallback; defaults to
+            expected_time_s. An infeasible 5 ms x 5000 run takes ~77 s, which a
+            timeout based on the requested 25 s would cut off.
+        analysis: how buffer timestamps map to periods. 'pulse_read': index 0 is
+            a baseline read, followed by n_expected_points-1 pulses. 'pulses':
+            one reading per pulse, no baseline. 'samples': a uniform sampling
+            grid whose requested spacing is `requested_period_s`.
+        n_is_exact (bool): the buffer must hold exactly n_expected_points
+            (pulse-read, visual per pulse). False when it is only an upper bound
+            (continuous sampling). A short buffer is then a failed run.
+
+    Raises:
+        LuaScriptStartedError: any failure after the script was started. The
+            device may already be partly stimulated, so callers must not re-run
+            the measurement elsewhere.
     """
+    started = False
     try:
+        # A completion token left over from an earlier run would end the wait
+        # below immediately and drop this run's timing report.
+        _drain_output(instrument)
+
         # Use loadandrunscript (anonymous) to avoid naming entirely.
         # No name → no script.delete needed → no error -292 on front panel.
         # endscript triggers immediate execution of the anonymous script.
@@ -1589,6 +2146,9 @@ def execute_lua_script_fast(instrument, lua_script, read_ch, n_expected_points,
         # endscript triggers immediate execution for loadandrunscript
         print("Executing LUA script on instrument...")
         instrument.write("endscript")
+        started = True
+
+        wait_s = feasible_time_s if feasible_time_s else expected_time_s
 
         # Wait for completion via LUA_DONE_TOKEN emitted as the script's
         # final statement. Deterministic and TSP-native — avoids the *OPC?
@@ -1599,7 +2159,7 @@ def execute_lua_script_fast(instrument, lua_script, read_ch, n_expected_points,
         # script. The token-based wait does zero bus traffic during execution.
         lua_timing = {}
         try:
-            lua_timing = _wait_lua_complete(instrument, expected_time_s) or {}
+            lua_timing = _wait_lua_complete(instrument, wait_s) or {}
         except Exception:
             # Token never arrived (VISA disruption or LUA error). Sleep the
             # expected duration, then check buffer count ONCE as a final
@@ -1609,7 +2169,7 @@ def execute_lua_script_fast(instrument, lua_script, read_ch, n_expected_points,
             # caller must not read its absence as "no overruns occurred".
             lua_timing = {'status': 'unavailable',
                           'reason': 'completion token not received'}
-            wait_time = expected_time_s if expected_time_s else 60
+            wait_time = wait_s if wait_s else 60
             print(f"  [LUA] completion token not received, waiting {wait_time:.1f}s...")
             time.sleep(wait_time)
             try:
@@ -1630,12 +2190,10 @@ def execute_lua_script_fast(instrument, lua_script, read_ch, n_expected_points,
                 pass  # If we can't check, assume completion after sleep
 
         # H5: ask the buffer how many readings it actually holds before reading
-        # from it. `n_expected_points` is an UPPER BOUND, not a count — the
-        # visual continuous mode deliberately inflates it by 2*n_pulses "for
-        # safety" — and requesting indices past `.n` makes the instrument raise
-        # error 5038, which made continuous I(t) fail at retrieval every single
-        # time. `_retrieve_buffer` already queries `.n` for exactly this reason;
-        # this path did not.
+        # from it. `n_expected_points` is an UPPER BOUND for continuous sampling,
+        # not a count, and requesting indices past `.n` makes the instrument
+        # raise error 5038. `_retrieve_buffer` already queries `.n` for exactly
+        # this reason; this path did not.
         #
         # The query happens AFTER execution has completed, so it does not
         # introduce the TSP context switches the timing architecture forbids
@@ -1656,12 +2214,23 @@ def execute_lua_script_fast(instrument, lua_script, read_ch, n_expected_points,
                 "but recorded nothing."
             )
 
+        if n_is_exact and n_available < n_expected_points:
+            raise RuntimeError(
+                f"Instrument buffer holds {n_available} of the {n_expected_points} "
+                "readings this sequence must produce (buffer full or readings "
+                "missed); the data set is incomplete."
+            )
+
         n_to_read = min(n_available, n_expected_points)
         if n_available < n_expected_points:
-            # Not necessarily a fault: continuous mode over-allocates on
-            # purpose. Reported so a genuinely short buffer is still visible.
+            # Not necessarily a fault: continuous mode sizes the buffer for the
+            # most it could need. Reported so a genuinely short buffer is still visible.
             print(f"  [LUA] buffer holds {n_available} points, "
                   f"upper bound was {n_expected_points}")
+
+        # Full-precision readback: the default 6 digits quantise timestamps to
+        # 1 ms beyond 100 s (10 ms beyond 1000 s) and raise false drift alarms.
+        _set_ascii_precision(instrument)
 
         print(f"✓ LUA script completed, retrieving {n_to_read} points...")
 
@@ -1706,30 +2275,50 @@ def execute_lua_script_fast(instrument, lua_script, read_ch, n_expected_points,
         # every number below was printed and then discarded, so nothing
         # downstream — not the results dict, not the CSV header, not the GUI —
         # could say whether the requested period had actually been delivered.
-        drift_report = {'status': 'not_analysed'}
+        # period_delivered is only ever True on evidence: a run whose period
+        # could not be checked is reported as NOT delivered and unverified.
+        drift_report = {'status': 'not_analysed', 'period_delivered': False,
+                        'period_verified': False}
+        median_ok = None
         try:
-            n_pulses = n_expected_points - 1
-            if len(timestamps) >= 3 and expected_time_s and n_pulses > 0:
-                expected_period_s = expected_time_s / n_pulses
-                # Noise floor 0.1 ms matches typical 2636B TSP cycle jitter
-                # (command dispatch, filter state updates). A threshold below
-                # that reports instrument overhead, not real drift.
-                if min_event_ms and min_event_ms > 0:
-                    drift_threshold_ms = max(0.1, min(1.0, 0.25 * min_event_ms))
-                else:
-                    drift_threshold_ms = 0.25
-
+            if analysis == 'samples':
+                if not requested_period_s:
+                    raise ValueError("analysis='samples' needs requested_period_s")
+                n_pulses = None
+                first = 0
+                expected_period_s = requested_period_s
+            elif analysis == 'pulses':
+                n_pulses = n_expected_points
+                first = 0
+                expected_period_s = (expected_time_s / n_pulses) if expected_time_s else None
+            elif analysis == 'pulse_read':
+                n_pulses = n_expected_points - 1
                 # Skip the first interval. timestamps[0] is the initial read,
                 # which happens a few ms after timer.reset() and is NOT a full
                 # stim_period away from timestamps[1]. Including it pulls the
                 # reported mean toward a large negative value that does not
                 # reflect actual per-cycle timing.
-                drifts_ms = [
-                    (timestamps[i+1] - timestamps[i] - expected_period_s) * 1000.0
-                    for i in range(1, len(timestamps) - 1)
+                first = 1
+                expected_period_s = (expected_time_s / n_pulses) if (expected_time_s and n_pulses > 0) else None
+            else:
+                raise ValueError(f"unknown timing analysis {analysis!r}")
+
+            if expected_period_s and len(timestamps) - first >= 2:
+                # Noise floor 0.1 ms matches typical 2636B TSP cycle jitter
+                # (command dispatch, filter state updates). A threshold below
+                # that reports instrument overhead, not real drift.
+                if analysis == 'samples':
+                    drift_threshold_ms = 0.1
+                elif min_event_ms and min_event_ms > 0:
+                    drift_threshold_ms = max(0.1, min(1.0, 0.25 * min_event_ms))
+                else:
+                    drift_threshold_ms = 0.25
+
+                measured_periods_ms = [
+                    (timestamps[i+1] - timestamps[i]) * 1000.0
+                    for i in range(first, len(timestamps) - 1)
                 ]
-                if not drifts_ms:
-                    raise ValueError("need at least two pulse timestamps for drift")
+                drifts_ms = [p - expected_period_s * 1000.0 for p in measured_periods_ms]
 
                 total_drift_ms = sum(drifts_ms)
                 max_drift_ms = max(drifts_ms)
@@ -1739,16 +2328,13 @@ def execute_lua_script_fast(instrument, lua_script, read_ch, n_expected_points,
 
                 # Delivered timing, measured from the instrument's own
                 # timestamps — the authority on what the device actually saw.
-                measured_periods_ms = [
-                    (timestamps[i+1] - timestamps[i]) * 1000.0
-                    for i in range(1, len(timestamps) - 1)
-                ]
-                measured_periods_ms.sort()
-                _mid = len(measured_periods_ms) // 2
+                sorted_ms = sorted(measured_periods_ms)
+                _mid = len(sorted_ms) // 2
                 median_period_ms = (
-                    measured_periods_ms[_mid] if len(measured_periods_ms) % 2
-                    else 0.5 * (measured_periods_ms[_mid - 1] + measured_periods_ms[_mid])
+                    sorted_ms[_mid] if len(sorted_ms) % 2
+                    else 0.5 * (sorted_ms[_mid - 1] + sorted_ms[_mid])
                 )
+                median_ok = median_period_ms <= expected_period_s * 1000.0 + drift_threshold_ms
                 drift_report = {
                     'status': 'ok',
                     'requested_period_ms': expected_period_s * 1000.0,
@@ -1758,41 +2344,57 @@ def execute_lua_script_fast(instrument, lua_script, read_ch, n_expected_points,
                     'total_drift_ms': total_drift_ms,
                     'threshold_ms': drift_threshold_ms,
                     'n_pulses_exceeding_threshold': len(drifted),
-                    'n_pulses': n_pulses,
+                    'n_pulses': n_pulses if n_pulses is not None else len(measured_periods_ms),
+                    'n_intervals': len(measured_periods_ms),
+                    'period_delivered': False, 'period_verified': False,
                 }
 
-                # Tier 1: always-on summary if any meaningful slip occurred
-                if abs(total_drift_ms) > 0.02 or max_drift_ms > 0.02:
-                    print(f"ℹ️  Drift summary over {n_pulses} pulses: "
-                          f"mean = {mean_drift_ms:+.3f} ms/cycle, "
-                          f"max = {max_drift_ms:+.3f} ms, "
-                          f"total = {total_drift_ms:+.2f} ms "
-                          f"(alert threshold = {drift_threshold_ms:.3f} ms)")
+                if analysis == 'samples':
+                    # Gaps next to pulse edges (a sample that would straddle an
+                    # edge is skipped) are expected; the MEDIAN spacing is the
+                    # delivered sampling interval.
+                    if not median_ok:
+                        print(f"⚠️  Delivered sample spacing {median_period_ms:.3f} ms "
+                              f"(median) is longer than the requested "
+                              f"{expected_period_s * 1000.0:.3f} ms.")
+                else:
+                    # Tier 1: always-on summary if any meaningful slip occurred
+                    if abs(total_drift_ms) > 0.02 or max_drift_ms > 0.02:
+                        print(f"ℹ️  Drift summary over {len(drifts_ms)} periods: "
+                              f"mean = {mean_drift_ms:+.3f} ms/cycle, "
+                              f"max = {max_drift_ms:+.3f} ms, "
+                              f"total = {total_drift_ms:+.2f} ms "
+                              f"(alert threshold = {drift_threshold_ms:.3f} ms)")
 
-                # Tier 2: per-pulse breakdown when any cycle crosses threshold
-                if drifted:
-                    worst_pulse, worst_ms = max(drifted, key=lambda x: x[1])
-                    print(f"⚠️  {len(drifted)}/{n_pulses} pulses exceeded "
-                          f"{drift_threshold_ms:.3f} ms drift threshold:")
-                    if len(drifted) <= 5:
-                        for pulse_num, d in drifted:
-                            print(f"      Pulse {pulse_num}: +{d:.3f} ms")
-                    else:
-                        print(f"      worst: pulse {worst_pulse} at +{worst_ms:.3f} ms")
+                    # Tier 2: per-pulse breakdown when any cycle crosses threshold
+                    if drifted:
+                        worst_pulse, worst_ms = max(drifted, key=lambda x: x[1])
+                        print(f"⚠️  {len(drifted)}/{len(drifts_ms)} periods exceeded "
+                              f"{drift_threshold_ms:.3f} ms drift threshold:")
+                        if len(drifted) <= 5:
+                            for pulse_num, d in drifted:
+                                print(f"      Pulse {pulse_num}: +{d:.3f} ms")
+                        else:
+                            print(f"      worst: pulse {worst_pulse} at +{worst_ms:.3f} ms")
         except Exception as e:
             # "We could not check" must never render as "we checked and it was
             # fine". This block used to swallow its own deliberate guard, so a
             # failed drift analysis produced total silence and the user read
             # the absence of a warning as confirmation of good timing.
-            drift_report = {'status': 'analysis_failed', 'error': repr(e)}
+            drift_report = {'status': 'analysis_failed', 'error': repr(e),
+                            'period_delivered': False, 'period_verified': False}
+            median_ok = None
             print(f"⚠️  Drift analysis FAILED: {e!r}\n"
                   f"    Timing quality is UNKNOWN for this run — the absence of a "
                   f"drift warning below does NOT mean the timing was good.")
 
         # The instrument's own overrun count, if the script reported one.
+        instrument_ok = None
         if lua_timing:
             drift_report['instrument_report'] = dict(lua_timing)
             n_over = lua_timing.get('overruns')
+            if isinstance(n_over, float):
+                instrument_ok = (n_over == 0)
             if isinstance(n_over, float) and n_over > 0:
                 print(f"⚠️  {int(n_over)}/{int(lua_timing.get('n_pulses', 0))} pulses could "
                       f"NOT meet the requested period (worst shortfall "
@@ -1800,6 +2402,14 @@ def execute_lua_script_fast(instrument, lua_script, read_ch, n_expected_points,
                       f"    The train ran at the hardware limit. The delivered period is "
                       f"longer than requested; use the buffer timestamps, not the nominal "
                       f"value, when reporting this measurement.")
+
+        verdicts = [v for v in (instrument_ok, median_ok) if v is not None]
+        drift_report['period_verified'] = bool(verdicts)
+        drift_report['period_delivered'] = bool(verdicts) and all(verdicts)
+        if median_ok is False and instrument_ok is not False and analysis != 'samples':
+            print("⚠️  The requested period was NOT delivered (median delivered "
+                  f"period {drift_report['delivered_period_ms_median']:.3f} ms vs "
+                  f"{drift_report['requested_period_ms']:.3f} ms requested).")
 
         # Check for errors (ignoring benign ones if any remain)
         try:
@@ -1832,11 +2442,18 @@ def execute_lua_script_fast(instrument, lua_script, read_ch, n_expected_points,
         return timestamps, currents
 
     except Exception as e:
-        try:
-            instrument.write("smua.source.output = smua.OUTPUT_OFF")
-            instrument.write("smub.source.output = smub.OUTPUT_OFF")
-        except: pass
-        raise e
+        _abort_outputs(instrument)
+        if started and not isinstance(e, LuaScriptStartedError):
+            reached, errs = _script_fault_report(instrument, read_ch)
+            raise LuaScriptStartedError(
+                f"The LUA script was already running when it failed ({e!r}); the "
+                f"read buffer had reached {reached} of {n_expected_points} points. "
+                f"Instrument error queue: {errs if errs else 'empty'}. The device may "
+                "be partly stimulated, so the measurement was NOT re-run on another "
+                "path; check the device state and repeat the run deliberately."
+            ) from e
+        raise
+
 
 # =============================================================================
 # INSTRUMENT MODEL VALIDATION
@@ -2240,10 +2857,10 @@ def safety_check(stim_level, max_safe_voltage=MAX_SAFE_STIM_VOLTAGE_V,
 def pulse_read_sequence(instrument, stim_ch, read_ch, params):
     """
     Core engine for electrical, visual, and memristor pulse measurements.
-    
-    Performs a sequence of stimulus pulses followed by read measurements to 
+
+    Performs a sequence of stimulus pulses followed by read measurements to
     characterize synaptic devices.
-    
+
     Args:
         instrument: PyVISA instrument resource
         stim_ch (str): Stimulus channel ('smua' or 'smub')
@@ -2261,7 +2878,7 @@ def pulse_read_sequence(instrument, stim_ch, read_ch, params):
             - settle_ms (float, optional): Extra settling time (default: 5)
             - measure_avg (int, optional): Number of measurements to average (default: 1)
             - wire_mode (str, optional): '2-Wire' or '4-Wire' (default: None)
-    
+
     Returns:
         dict: Results containing:
             - pulse_number: List of pulse indices
@@ -2270,13 +2887,22 @@ def pulse_read_sequence(instrument, stim_ch, read_ch, params):
             - V_read_V: List of read voltages in V
             - conductance_S: List of conductance values in S
             - params: Copy of input parameters
+            - timing: what the run actually delivered, including
+              `period_delivered` (bool), the delivered median period and
+              `settle_warning` (None, or why the readings are not settled)
+
+    Raises:
+        LuaScriptStartedError: the on-instrument script failed after it had
+            started; the measurement is deliberately NOT re-run.
     """
+    _check_channels(stim_ch, read_ch)
+
     results = {
-        "pulse_number": [], 
-        "time_s": [], 
-        "I_A": [], 
-        "V_read_V": [], 
-        "conductance_S": [], 
+        "pulse_number": [],
+        "time_s": [],
+        "I_A": [],
+        "V_read_V": [],
+        "conductance_S": [],
         "params": params.copy(),
         "metadata": {
             "wavelength_nm": params.get('wavelength_nm', None),
@@ -2287,18 +2913,16 @@ def pulse_read_sequence(instrument, stim_ch, read_ch, params):
             "device_area_cm2": params.get('device_area_cm2', None)
         }
     }
-    
+
     # Extract parameters with defaults
-    settle_ms = params.get('settle_ms', 5)
-    measure_avg = params.get('measure_avg', 1)
     nplc = params.get('nplc', 1.0)
-    
+
     # === INSTRUMENT CAPABILITY CHECK ===
     # Check if instrument supports requested current level
     if params['stim_drive_type'] == 'I':  # Current sourcing mode
         requested_current = abs(params['stim_level'])
         max_current = get_max_current(instrument)
-        
+
         if requested_current > max_current:
             model = validate_instrument_model(instrument)
             raise ValueError(
@@ -2311,7 +2935,7 @@ def pulse_read_sequence(instrument, stim_ch, read_ch, params):
                 f"measurement path. Reduce the current level, or use one of the "
                 f"models listed above."
             )
-    
+
     # Record instrument voltage ceiling for the LUA range picker before either
     # execution path runs. Without this the generator falls back to its default
     # (10 V) and picks 40 V family ranges on a 200 V model, triggering -222.
@@ -2364,6 +2988,11 @@ def pulse_read_sequence(instrument, stim_ch, read_ch, params):
         lua_script = generate_pulse_read_lua_script(stim_ch, read_ch, params)
         n_expected_points = params['n_pulses'] + 1  # Initial read + pulses
         expected_time_s = params['stim_period_ms'] * params['n_pulses'] / 1000.0
+        # A period below the generator's minimum cannot be delivered; the run
+        # then takes n x minimum, and waiting only for the nominal time would
+        # time out a healthy run (5 ms x 5000 takes ~77 s against 62.5 s).
+        feasible_time_s = (max(params['stim_period_ms'], lua_script.facts['min_period_ms'])
+                           * params['n_pulses'] / 1000.0)
 
         # Smallest event in the cycle — used to scale the post-hoc drift
         # threshold so a 0.3 ms read pulse alerts at ~0.15 ms drift instead
@@ -2388,15 +3017,24 @@ def pulse_read_sequence(instrument, stim_ch, read_ch, params):
         # is a software fault, not an instrument fault, and silently converting
         # it into "LUA failed → fall back" would re-run the whole measurement
         # on the other path and blame the instrument.
+        #
+        # Fallback is only for failures BEFORE the script ran (upload,
+        # capability). Once `endscript` was sent the device may already be
+        # partly stimulated, and a re-run would start from that altered state
+        # and report it as the baseline: LuaScriptStartedError propagates.
         lua_data = None
         lua_timing_report = {}
         try:
             lua_data = execute_lua_script_fast(
                 instrument, lua_script, read_ch, n_expected_points,
                 expected_time_s=expected_time_s,
+                feasible_time_s=feasible_time_s,
                 min_event_ms=min_event_ms_local,
                 timing_out=lua_timing_report,
+                n_is_exact=True,
             )
+        except LuaScriptStartedError:
+            raise
         except Exception as e:
             print(f"WARNING: LUA execution failed: {e}")
             print("Falling back to standard execution...")
@@ -2436,17 +3074,20 @@ def pulse_read_sequence(instrument, stim_ch, read_ch, params):
             # thrown away, so a train that could not hold its requested period
             # exported under that period with nothing recording the shortfall.
             results['timing'] = dict(lua_timing_report)
+            results['timing']['min_period_ms'] = lua_script.facts['min_period_ms']
+            results['timing']['settle_warning'] = lua_script.facts['settle_warning']
             return results
 
 
     # --- STANDARD EXECUTION PATH ---
     #
-    # Reached when the instrument cannot run LUA, or when LUA execution failed
-    # above. It is deliberately a faithful software mirror of
+    # Reached when the instrument cannot run LUA, or when LUA failed BEFORE the
+    # script ran (see above). It is deliberately a faithful software mirror of
     # generate_pulse_read_lua_script: same baseline read, same fixed ranging,
-    # same averaging derivation, same conductance convention. Only the timing
-    # source differs (host clock instead of the instrument's timer), which is
-    # unavoidable off-instrument and is the reason LUA is preferred.
+    # same ADC state, same averaging derivation, same conductance convention.
+    # Only the timing source differs (host clock instead of the instrument's
+    # timer), which is unavoidable off-instrument and is the reason LUA is
+    # preferred.
     #
     # These two paths MUST stay equivalent. When they diverged, the same GUI
     # settings produced different physical quantities depending on which one
@@ -2457,6 +3098,11 @@ def pulse_read_sequence(instrument, stim_ch, read_ch, params):
     # Stamped here rather than before the LUA attempt, so that a LUA run which
     # failed and fell through is recorded as what it actually was.
     results['execution_path'] = 'standard'
+
+    # Same validation and defaults the LUA generator applies.
+    plan = _pulse_read_plan(stim_ch, read_ch, params)
+    if plan['settle_warning']:
+        print(f"⚠️  {plan['settle_warning']}")
 
     # --- CONFIGURATION PHASE ---
 
@@ -2472,9 +3118,12 @@ def pulse_read_sequence(instrument, stim_ch, read_ch, params):
 
     # Same derivation the LUA generator uses, so the GUI's NPLC / Read Pulse
     # Width / Samples per Pulse controls mean the same thing on both paths.
-    nplc, measure_avg = derive_measurement_averaging(params)
-    fixed_i_range = get_fixed_current_range(params['compliance_A'])
+    nplc, n_samples = plan['nplc'], plan['measure_avg']
+    fixed_i_range = plan['fixed_i_range']
     read_voltage = params['read_voltage']
+    stim_level_attr = 'levelv' if params['stim_drive_type'] == 'V' else 'leveli'
+    read_delay_s = plan['read_delay_ms'] / 1000.0
+    read_settle_s = plan['read_settle_delay_ms'] / 1000.0
 
     # 1. Configure Read Channel (for low-level DC bias and measurement).
     #    Fixed ranging, matching the LUA path: autorange would make the
@@ -2484,11 +3133,16 @@ def pulse_read_sequence(instrument, stim_ch, read_ch, params):
     instrument.write(f"{read_ch}.source.rangev = {_get_fixed_voltage_range(read_voltage, params['max_voltage'])}")
     instrument.write(f"{read_ch}.source.limiti = {params['compliance_A']}")
     instrument.write(f"{read_ch}.measure.rangei = {fixed_i_range}")
-    instrument.write(f"{read_ch}.measure.autozero = {read_ch}.AUTOZERO_OFF")
     instrument.write(f"{read_ch}.measure.autorangei = {read_ch}.AUTORANGE_OFF")
-    instrument.write(f"{read_ch}.measure.nplc = {nplc}")
-    instrument.write(f"{read_ch}.measure.count = 1")
-    instrument.write(f"{read_ch}.source.output = {read_ch}.OUTPUT_OFF")
+    # The complete ADC state — delay, nplc, count, filter, autozero — exactly as
+    # the LUA script sets it. Writing the filter only when averaging > 1 let a
+    # dirty ON/8 state from an earlier run leak into this one.
+    for line in _emit_read_adc_setup(read_ch, nplc, n_samples):
+        instrument.write(line)
+    if n_samples > 1:
+        # Ceiling is the hardware limit, shared with the LUA path.
+        n_samples_clamped = max(2, min(n_samples, FILTER_COUNT_MAX))
+        print(f"ℹ️  Hardware averaging: {n_samples_clamped} samples")
 
     # 2. Configure Stimulus Channel (fixed ranges, as in the LUA path)
     if params['stim_drive_type'] == 'V':
@@ -2499,17 +3153,19 @@ def pulse_read_sequence(instrument, stim_ch, read_ch, params):
     else:
         instrument.write(f"{stim_ch}.source.func = {stim_ch}.OUTPUT_DCAMPS")
         instrument.write(f"{stim_ch}.source.leveli = 0")
-        instrument.write(f"{stim_ch}.source.rangei = {fixed_i_range}")
+        # The sourced current's range, not the compliance's.
+        instrument.write(f"{stim_ch}.source.rangei = {get_fixed_current_range(abs(params['stim_level']))}")
         # Voltage compliance from the instrument's actual ceiling, as the LUA
         # path does. A hardcoded 10 V here silently clamped current-driven
         # stimuli on a 200 V instrument.
         instrument.write(f"{stim_ch}.source.limitv = {params['max_voltage']}")
 
-    instrument.write(f"{stim_ch}.source.output = {stim_ch}.OUTPUT_OFF")
-
-    # 3. Set Read Channel to idle state (0V)
+    # 3. Both outputs ON once, at level 0; pulses are level changes only (as in
+    #    the LUA script — see there for why OUTPUT_OFF is not toggled per pulse).
     instrument.write(f"{read_ch}.source.levelv = 0")
     instrument.write(f"{read_ch}.source.output = {read_ch}.OUTPUT_ON")
+    time.sleep(plan['settle_ms'] / 1000.0)
+    instrument.write(f"{stim_ch}.source.output = {stim_ch}.OUTPUT_ON")
 
     # === BUFFER CLEARING: Clear only what's necessary ===
     instrument.write("*CLS")  # Clear instrument error queue
@@ -2517,24 +3173,6 @@ def pulse_read_sequence(instrument, stim_ch, read_ch, params):
 
     # --- MEASUREMENT LOOP ---
 
-    n_samples = measure_avg
-
-    # === CONFIGURE HARDWARE FILTER ONCE (outside loop) ===
-    if n_samples > 1:
-        # Ceiling is the hardware limit, shared with the LUA path. There used
-        # to be a second, lower cap (50) here, so the same "Samples per Pulse"
-        # value averaged differently depending on the execution path.
-        n_samples_clamped = max(2, min(n_samples, FILTER_COUNT_MAX))
-
-        instrument.write(f"{read_ch}.measure.filter.enable = {read_ch}.FILTER_ON")
-        instrument.write(f"{read_ch}.measure.filter.type = {read_ch}.FILTER_REPEAT_AVG")
-        instrument.write(f"{read_ch}.measure.filter.count = {n_samples_clamped}")
-
-        if n_samples <= FILTER_COUNT_MAX:
-            print(f"ℹ️  Hardware averaging: {n_samples_clamped} samples")
-        else:
-            print(f"ℹ️  Hardware averaging: {n_samples_clamped} samples (requested {n_samples}, clamped for efficiency)")
-    
     def _read_conductance():
         """Apply the read bias, measure, return to 0 V. Returns (I_A, G_S).
 
@@ -2542,7 +3180,7 @@ def pulse_read_sequence(instrument, stim_ch, read_ch, params):
         measurement, back to 0 V idle.
         """
         instrument.write(f"{read_ch}.source.levelv = {read_voltage}")
-        time.sleep(params.get('read_settle_delay_ms', 5) / 1000.0)
+        time.sleep(read_settle_s)
         I = float(instrument.query(f"print({read_ch}.measure.i())").strip())
         instrument.write(f"{read_ch}.source.levelv = 0")
         # Conductance is undefined at zero read bias; NaN says so rather than
@@ -2551,6 +3189,9 @@ def pulse_read_sequence(instrument, stim_ch, read_ch, params):
         return I, G
 
     t0 = time.time()
+    pulse_starts = []
+    n_overruns = 0
+    worst_overrun_ms = 0.0
 
     try:
         # --- INITIAL BASELINE READ (pulse_number 0) ---
@@ -2569,24 +3210,20 @@ def pulse_read_sequence(instrument, stim_ch, read_ch, params):
 
         for i in range(params['n_pulses']):
             pulse_start = time.time()
+            pulse_starts.append(pulse_start)
 
-            # --- STIMULUS ON ---
-            if params['stim_drive_type'] == 'V':
-                instrument.write(f"{stim_ch}.source.levelv = {params['stim_level']}")
-            else:
-                instrument.write(f"{stim_ch}.source.leveli = {params['stim_level']}")
-            
-            instrument.write(f"{stim_ch}.source.output = {stim_ch}.OUTPUT_ON")
-            
+            # --- STIMULUS ON (level change; the output stays ON) ---
+            instrument.write(f"{stim_ch}.source.{stim_level_attr} = {params['stim_level']}")
+
             # Wait for pulse duration
-            time.sleep(params['stim_width_ms'] / 1000.0)
-            
+            time.sleep(plan['stim_width_ms'] / 1000.0)
+
             # --- STIMULUS OFF ---
-            instrument.write(f"{stim_ch}.source.output = {stim_ch}.OUTPUT_OFF")
-            
+            instrument.write(f"{stim_ch}.source.{stim_level_attr} = 0")
+
             # --- WAIT READ DELAY ---
-            time.sleep(params['read_delay_ms'] / 1000.0)
-            
+            time.sleep(read_delay_s)
+
             # --- APPLY READ BIAS AND MEASURE CURRENT ---
             I_meas, G_meas = _read_conductance()
 
@@ -2601,33 +3238,62 @@ def pulse_read_sequence(instrument, stim_ch, read_ch, params):
             # --- WAIT REMAINDER OF PERIOD ---
             pulse_elapsed = time.time() - pulse_start
             remaining_time = (params['stim_period_ms'] / 1000.0) - pulse_elapsed
-            
+
             if remaining_time > 0:
                 time.sleep(remaining_time)
-            elif remaining_time < -0.010:  # Warn if >10ms over budget
-                print(f"⚠️  Pulse {i}: Period exceeded by {-remaining_time*1000:.1f} ms")
-        
+            else:
+                n_overruns += 1
+                worst_overrun_ms = max(worst_overrun_ms, -remaining_time * 1000.0)
+                if remaining_time < -0.010:  # Warn if >10ms over budget
+                    print(f"⚠️  Pulse {i}: Period exceeded by {-remaining_time*1000:.1f} ms")
+
     finally:
-        # Ensure all outputs are OFF
+        # Levels to 0 BEFORE the outputs go off, and the filter off, so nothing
+        # live (a 1 V stim level, filter ON/count 10) leaks into the next run.
+        instrument.write(f"{stim_ch}.source.{stim_level_attr} = 0")
+        instrument.write(f"{read_ch}.source.levelv = 0")
         instrument.write(f"{stim_ch}.source.output = {stim_ch}.OUTPUT_OFF")
         instrument.write(f"{read_ch}.source.output = {read_ch}.OUTPUT_OFF")
-        
-        # === Disable hardware filter ===
-        if n_samples > 1:
-            instrument.write(f"{read_ch}.measure.filter.enable = {read_ch}.FILTER_OFF")
-    
+        instrument.write(f"{read_ch}.measure.filter.enable = {read_ch}.FILTER_OFF")
+        for line in _emit_restore_adc(read_ch):
+            instrument.write(line)
+
+    delivered_ms = [(b - a) * 1000.0 for a, b in zip(pulse_starts, pulse_starts[1:])]
+    delivered_ms.sort()
+    if delivered_ms:
+        _mid = len(delivered_ms) // 2
+        median_ms = (delivered_ms[_mid] if len(delivered_ms) % 2
+                     else 0.5 * (delivered_ms[_mid - 1] + delivered_ms[_mid]))
+    else:
+        median_ms = float('nan')
+    # Host-timed: "delivered" means no pulse's own work outlasted the period.
+    results['timing'] = {
+        'status': 'host_timed',
+        'requested_period_ms': params['stim_period_ms'],
+        'delivered_period_ms_median': median_ms,
+        'n_overruns': n_overruns,
+        'worst_overrun_ms': worst_overrun_ms,
+        'period_delivered': n_overruns == 0,
+        'period_verified': True,
+        'min_period_ms': plan['min_period_ms'],
+        'settle_warning': plan['settle_warning'],
+    }
+    if n_overruns:
+        print(f"⚠️  {n_overruns}/{params['n_pulses']} pulses could NOT meet the requested "
+              f"{params['stim_period_ms']:g} ms period (worst shortfall {worst_overrun_ms:.1f} ms).")
+
     # Check for instrument errors before returning
     try:
         error_check = instrument.query("print(errorqueue.count)")
-        if int(error_check.strip()) > 0:
+        if int(float(error_check.strip())) > 0:
             print(f"⚠️ Warning: {error_check.strip()} errors in instrument queue")
             # Read and print errors
-            for _ in range(min(5, int(error_check.strip()))):
+            for _ in range(min(5, int(float(error_check.strip())))):
                 error_msg = instrument.query("print(errorqueue.next())")
                 print(f"   Error: {error_msg.strip()}")
     except:
         pass  # Don't fail measurement if error check fails
-    
+
     return results
 
 # =============================================================================
@@ -2638,14 +3304,15 @@ def simulate_pulse_read(params):
     """
     Simulates a pulse-read sequence for testing without hardware.
     Models simple exponential conductance change for LTP/LTD behavior.
-    
+
     Args:
         params (dict): Same parameters as pulse_read_sequence
-    
+
     Returns:
-        dict: Results in same format as pulse_read_sequence
+        dict: Results in same format as pulse_read_sequence: n_pulses + 1
+        points, index 0 being the pre-stimulus baseline (as on the instrument).
     """
-    
+
     # === SIMULATION CURRENT LIMIT CHECK ===
     # Warn if simulating beyond 2612B capability
     if params['stim_drive_type'] == 'I':
@@ -2655,25 +3322,35 @@ def simulate_pulse_read(params):
             print(f"    This exceeds the 200 V family's 1.5 A DC capability.")
             print(f"    Models reaching {_highest_dc_current_A():g} A DC: "
                   f"{', '.join(_models_at_highest_dc_current())}.")
-    
+
     results = {
-        "pulse_number": [], 
-        "time_s": [], 
-        "I_A": [], 
-        "V_read_V": [], 
-        "conductance_S": [], 
+        "pulse_number": [],
+        "time_s": [],
+        "I_A": [],
+        "V_read_V": [],
+        "conductance_S": [],
         "params": params.copy()
     }
-    
+
     # Simulation parameters
     G_initial = 1e-6  # 1 µS initial conductance
     G_max = 1e-4      # 100 µS maximum conductance
     G_min = 1e-7      # 0.1 µS minimum conductance
     step_size = 0.05  # Learning rate (5% change per pulse)
-    
+
     G_current = G_initial
+    V_read = params['read_voltage']
     t0 = time.time()
-    
+
+    # Index 0: the pre-stimulus baseline, as the instrument paths record it
+    # (the CSV header says pulse_index_0=pre_stimulus_baseline). Measurement
+    # noise only; no pulse has been applied yet.
+    results["pulse_number"].append(0)
+    results["time_s"].append(0.0)
+    results["I_A"].append(G_current * V_read * (1 + np.random.uniform(-0.01, 0.01)))
+    results["V_read_V"].append(V_read)
+    results["conductance_S"].append(G_current)
+
     for i in range(params['n_pulses']):
         # Apply conductance change based on stimulus polarity
         if params['stim_level'] > 0:
@@ -2682,28 +3359,27 @@ def simulate_pulse_read(params):
         else:
             # LTD (Depression): Move toward G_min
             G_current += (G_min - G_current) * step_size
-        
+
         # Clip to physical limits
         G_current = np.clip(G_current, G_min, G_max)
-        
+
         # Apply small random noise (±2%)
         G_current *= (1 + np.random.uniform(-0.02, 0.02))
-        
+
         # Calculate measured current
-        V_read = params['read_voltage']
         I_meas = G_current * V_read
-        
+
         # Add measurement noise
         I_meas *= (1 + np.random.uniform(-0.01, 0.01))
-        
+
         # Store results
         t_rel = time.time() - t0
-        results["pulse_number"].append(i)
+        results["pulse_number"].append(i + 1)
         results["time_s"].append(t_rel)
         results["I_A"].append(I_meas)
         results["V_read_V"].append(V_read)
         results["conductance_S"].append(G_current)
-        
+
         # Simulate timing
         time.sleep(params['stim_period_ms'] / 1000.0)
 
@@ -2713,6 +3389,7 @@ def simulate_pulse_read(params):
     # numbers can travel the whole CSV -> JSON -> fit pipeline unchallenged.
     results['simulated'] = True
     results['data_source'] = 'synthetic_model'
+    results['execution_path'] = 'simulation'
 
     return results
 
@@ -2754,6 +3431,8 @@ def visual_synapse_sequence(instrument, stim_ch, read_ch, params, continuous_mod
             - params: Copy of input parameters
             - mode: 'visual_standard' or 'visual_continuous'
     """
+    _check_channels(stim_ch, read_ch)
+
     # Initialize results structure
     results = {
         "pulse_number": [],
@@ -2792,15 +3471,19 @@ def visual_synapse_sequence(instrument, stim_ch, read_ch, params, continuous_mod
     # Generate appropriate LUA script
     if continuous_mode:
         lua_script = generate_visual_continuous_lua_script(stim_ch, read_ch, params)
-        # Calculate expected points for continuous mode
-        pulse_period_s = params['pulse_period_ms'] / 1000.0
-        sample_interval_s = params.get('sample_interval_ms', 1.0) / 1000.0
-        total_time_s = pulse_period_s * params['n_pulses']
-        n_expected_points = int(total_time_s / sample_interval_s) + params['n_pulses'] * 2
+        # Exact upper bound on the samples the script can take
+        n_expected_points = lua_script.facts['max_samples']
+        analysis = 'samples'
+        sample_interval_s = lua_script.facts['sample_interval_ms'] / 1000.0
     else:
         lua_script = generate_visual_synapse_lua_script(stim_ch, read_ch, params)
+        # One reading per pulse, no baseline read: every interval is a period.
         n_expected_points = params['n_pulses']
+        analysis = 'pulses'
+        sample_interval_s = None
 
+    # pulse_period >= pulse_width is enforced by the generators, so the
+    # requested duration is always deliverable.
     expected_time_s = params['pulse_period_ms'] * params['n_pulses'] / 1000.0
 
     print(f"Using LUA execution for visual synapse measurement...")
@@ -2810,9 +3493,14 @@ def visual_synapse_sequence(instrument, stim_ch, read_ch, params, continuous_mod
 
     try:
         # Execute LUA script
+        timing_report = {}
         timestamps, currents = execute_lua_script_fast(
             instrument, lua_script, read_ch, n_expected_points,
-            expected_time_s=expected_time_s
+            expected_time_s=expected_time_s,
+            timing_out=timing_report,
+            analysis=analysis,
+            requested_period_s=sample_interval_s,
+            n_is_exact=not continuous_mode,
         )
 
         # Process results
@@ -2825,6 +3513,15 @@ def visual_synapse_sequence(instrument, stim_ch, read_ch, params, continuous_mod
 
             if not continuous_mode:
                 results['pulse_number'].append(i)
+
+        results['execution_path'] = 'lua'
+        # What the instrument delivered, plus the settling / sampling caveats
+        # computed while generating the script (None when there are none).
+        results['timing'] = dict(timing_report)
+        results['timing']['settle_warning'] = lua_script.facts['settle_warning']
+        if continuous_mode:
+            results['timing']['sample_warning'] = lua_script.facts['sample_warning']
+            results['timing']['sample_interval_ms'] = lua_script.facts['sample_interval_ms']
 
         # Display summary
         if results['Jsc_A']:
@@ -2839,13 +3536,9 @@ def visual_synapse_sequence(instrument, stim_ch, read_ch, params, continuous_mod
         return results
 
     except Exception as e:
-        # Ensure outputs are off on error
-        try:
-            instrument.write(f"{stim_ch}.source.output = {stim_ch}.OUTPUT_OFF")
-            instrument.write(f"{read_ch}.source.output = {read_ch}.OUTPUT_OFF")
-        except:
-            pass
-        raise e
+        # Ensure outputs are off on error (levels to 0 first)
+        _abort_outputs(instrument)
+        raise
 
 
 def simulate_visual_synapse(params, continuous_mode=False):
@@ -3013,6 +3706,20 @@ def save_visual_synapse_data(results, filename):
     # Header with metadata
     csv_content.append("# Visual (Self-Powered) Synapse Characterization")
     csv_content.append(f"# mode={results.get('mode', 'visual_standard')}")
+    csv_content.append(f"# execution_path={results.get('execution_path', 'unknown')}")
+
+    # Delivered timing and settling verdict, exactly as for the pulse-read export:
+    # a run that did not hold its period or whose readings were not settled must
+    # say so in the file, not only on the console.
+    _timing = results.get('timing') or {}
+    if _timing:
+        csv_content.append(
+            "# " + " # ".join(f"timing_{k}={v}" for k, v in _timing.items())
+        )
+        if _timing.get('settle_warning'):
+            csv_content.append(f"# SETTLE_WARNING: {_timing['settle_warning']}")
+    else:
+        csv_content.append("# timing_status=not_recorded")
 
     # Parameters
     param_str = " # ".join(f"{k}={v}" for k, v in params.items() if not isinstance(v, dict))
@@ -3150,6 +3857,10 @@ def process_and_save_synapse_data(results_dict, filename):
         csv_content.append(
             "# " + " # ".join(f"timing_{k}={v}" for k, v in _timing.items())
         )
+        if _timing.get('settle_warning'):
+            # Spelled out on its own line: the readings are not settled to
+            # specification, which affects how far every conductance can be trusted.
+            csv_content.append(f"# SETTLE_WARNING: {_timing['settle_warning']}")
     else:
         csv_content.append("# timing_status=not_recorded")
 
@@ -3183,31 +3894,110 @@ def process_and_save_synapse_data(results_dict, filename):
 # STEP 6: SRDP AND STDP CHARACTERIZATION
 # =============================================================================
 
+def _validate_srdp_sweep(base_params, freq_list_hz, require_read_bias=True):
+    """Whole-sweep SRDP validation. Touches no instrument.
+
+    Returns the frequencies as floats. Everything that can be wrong with the
+    request is decided here, before the first pulse: n_pulses = -4 used to
+    reach the instrument and fail with a raw IndexError after a script had run,
+    and n_pulses = 0 "completed" with empty arrays.
+    """
+    n = base_params.get('n_pulses')
+    if n is None or int(n) != n or int(n) < 1:
+        raise ValueError(f"SRDP n_pulses must be a whole number >= 1, got {n!r}")
+    freqs = [float(f) for f in freq_list_hz]
+    if not freqs:
+        raise ValueError("SRDP frequency list is empty")
+    if not all(np.isfinite(f) and f > 0 for f in freqs):
+        raise ValueError(f"SRDP frequencies must be finite and > 0 Hz, got {list(freq_list_hz)!r}")
+    # The device keeps its state from one frequency to the next, so the order is
+    # part of the measurement: a descending sweep measures each rate against the
+    # history of the faster ones and is not comparable with an ascending one.
+    if any(b < a for a, b in zip(freqs, freqs[1:])):
+        raise ValueError(
+            "SRDP frequencies must be in ascending order (end frequency >= start "
+            f"frequency); got {freqs!r}. Re-order them, or swap Start and End.")
+    if require_read_bias and base_params.get('read_voltage', 0) == 0:
+        raise ValueError("SRDP needs a non-zero read voltage: conductance is undefined at 0 V")
+    return freqs
+
+
+# A point whose delivered rate falls this far below the requested one has hit
+# the instrument's ceiling (the loop runs flat out), so any faster request would
+# deliver the same rate.
+SRDP_CLIP_TOLERANCE_PERCENT = 5.0
+# Two delivered rates this close are the same operating point.
+SRDP_SAME_RATE_TOLERANCE = 0.02
+
+
+def _validate_srdp_sweep(base_params, freq_list_hz, require_read_bias=True):
+    """Whole-sweep SRDP validation. Touches no instrument.
+
+    Returns the frequencies as floats. Everything that can be wrong with the
+    request is decided here, before the first pulse: n_pulses = -4 used to
+    reach the instrument and fail with a raw IndexError after a script had run,
+    and n_pulses = 0 "completed" with empty arrays.
+    """
+    n = base_params.get('n_pulses')
+    if n is None or int(n) != n or int(n) < 1:
+        raise ValueError(f"SRDP n_pulses must be a whole number >= 1, got {n!r}")
+    freqs = [float(f) for f in freq_list_hz]
+    if not freqs:
+        raise ValueError("SRDP frequency list is empty")
+    if not all(np.isfinite(f) and f > 0 for f in freqs):
+        raise ValueError(f"SRDP frequencies must be finite and > 0 Hz, got {list(freq_list_hz)!r}")
+    # The device keeps its state from one frequency to the next, so the order is
+    # part of the measurement: a descending sweep measures each rate against the
+    # history of the faster ones and is not comparable with an ascending one.
+    if any(b < a for a, b in zip(freqs, freqs[1:])):
+        raise ValueError(
+            "SRDP frequencies must be in ascending order (end frequency >= start "
+            f"frequency); got {freqs!r}. Re-order them, or swap Start and End.")
+    if require_read_bias and base_params.get('read_voltage', 0) == 0:
+        raise ValueError("SRDP needs a non-zero read voltage: conductance is undefined at 0 V")
+    return freqs
+
+
+# A point whose delivered rate falls this far below the requested one has hit
+# the instrument's ceiling (the loop runs flat out), so any faster request would
+# deliver the same rate.
+SRDP_CLIP_TOLERANCE_PERCENT = 5.0
+# Two delivered rates this close are the same operating point.
+SRDP_SAME_RATE_TOLERANCE = 0.02
+
+
 def measure_srdp(instrument, stim_ch, read_ch, base_params, freq_list_hz):
     """
     Measures Spike-Rate-Dependent Plasticity (SRDP).
-    
+
     Sweeps through different spike frequencies and measures the resulting
     conductance change (ΔG) to characterize rate-dependent learning.
-    
+
     Args:
         instrument: PyVISA instrument resource
         stim_ch (str): Stimulus channel ('smua' or 'smub')
         read_ch (str): Read channel ('smua' or 'smub')
         base_params (dict): Base measurement parameters (stim_level, read_voltage, etc.)
-        freq_list_hz (list): List of frequencies to test in Hz
-    
+        freq_list_hz (list): Frequencies to test in Hz, ascending
+
     Returns:
         dict: SRDP results containing:
-            - frequencies_hz: List of tested frequencies
+            - frequencies_hz: DELIVERED frequencies of the measured points
+            - requested_frequencies_hz: what was asked for at those points
+            - skipped_frequencies: requests not measured, each with the reason
+              (repeated, or beyond the rate the instrument had already saturated at)
             - delta_g_S: List of conductance changes
             - delta_g_percent: List of relative conductance changes
             - g_initial_S: List of initial conductances
             - g_final_S: List of final conductances
+            - execution_path / timing / frequency_source: one entry per point
             - base_params: Copy of base parameters
     """
     if stim_ch == read_ch:
         raise ValueError("Stim and Read channels must be different for SRDP measurements")
+
+    # Validate the whole request before any instrument access (queries included).
+    freq_list_hz = _validate_srdp_sweep(base_params, freq_list_hz)
 
     # Adopt the instrument's auto-detected mains frequency unless overridden.
     resolve_line_freq(instrument, base_params)
@@ -3231,7 +4021,7 @@ def measure_srdp(instrument, stim_ch, read_ch, base_params, freq_list_hz):
                 f"ERROR: SRDP stimulus level {stim_voltage}V exceeds instrument capability.\n"
                 f"Connected: {model} (Max: {max_voltage}V)"
             )
-    
+
     results = {
         # DELIVERED frequencies, measured from the instrument's own timestamps
         # — see the note where they are computed. This is the axis every
@@ -3241,109 +4031,202 @@ def measure_srdp(instrument, stim_ch, read_ch, base_params, freq_list_hz):
         # how far the instrument fell short.
         "requested_frequencies_hz": [],
         "frequency_shortfall_percent": [],
+        "frequency_source": [],
+        "skipped_frequencies": [],
         "delta_g_S": [],
         "delta_g_percent": [],
         "g_initial_S": [],
         "g_final_S": [],
+        # Per point, as pulse-read stamps them: which path produced it and what
+        # timing the instrument reported.
+        "execution_path": [],
+        "timing": [],
         "base_params": base_params.copy()
     }
 
+    # Frequencies the instrument is known to deliver identically are measured
+    # once. Requests repeated verbatim go first; beyond that, once a point shows
+    # the loop running flat out, every faster request would only re-measure it.
+    seen = set()
+    saturated_at_hz = None
+    last_delivered_hz = None
+
+    # The line frequency here is the RESOLVED one (resolve_line_freq above),
+    # never the module default.
+    NPLC_PERIOD_MS = 1000.0 / _line_freq_hz(base_params)
+    nplc_eff, avg_eff = derive_measurement_averaging(base_params)
+    meas_time_ms = nplc_eff * NPLC_PERIOD_MS * avg_eff
+
     for freq_hz in freq_list_hz:
+        if freq_hz in seen:
+            results["skipped_frequencies"].append(
+                {"requested_hz": freq_hz, "reason": "repeated request"})
+            continue
+        seen.add(freq_hz)
+        if saturated_at_hz is not None:
+            results["skipped_frequencies"].append(
+                {"requested_hz": freq_hz,
+                 "reason": f"instrument already saturated at {saturated_at_hz:.4g} Hz; "
+                           "this request would deliver the same rate"})
+            continue
+
         # Calculate period from frequency
         period_ms = 1000.0 / freq_hz
-        
-        # Compute actual measurement time from read_width_ms and NPLC
-        NPLC_PERIOD_MS = 1000.0 / _line_freq_hz(base_params)
-        nplc = base_params.get('nplc', 1.0)
-        read_width_ms = base_params.get('read_width_ms', None)
-        if read_width_ms is not None and read_width_ms > 0:
-            actual_nplc = min(nplc, read_width_ms / NPLC_PERIOD_MS)
-            actual_nplc = max(0.001, actual_nplc)
-            meas_time_ms = actual_nplc * NPLC_PERIOD_MS
-        else:
-            meas_time_ms = nplc * NPLC_PERIOD_MS
 
         # Warn if period is shorter than physical minimum (instrument will run as fast as it can)
         min_period = base_params['stim_width_ms'] + base_params['read_delay_ms'] + meas_time_ms + 0.5
         if period_ms < min_period:
             print(f"⚠️  Frequency {freq_hz:.1f} Hz: requested period {period_ms:.2f} ms < minimum {min_period:.2f} ms. "
                   f"Instrument will run as fast as possible.")
-        
+
         # Update parameters for this frequency
         freq_params = base_params.copy()
         freq_params['stim_period_ms'] = period_ms
-        
+
         # Run pulse-read sequence
         pulse_results = pulse_read_sequence(instrument, stim_ch, read_ch, freq_params)
-        
+
         # Extract initial and final conductance
         g_list = np.array(pulse_results["conductance_S"])
         g_valid = g_list[~np.isnan(g_list)]
-        
-        if len(g_valid) >= 2:
-            g_initial = g_valid[0]
-            g_final = g_valid[-1]
-            delta_g = g_final - g_initial
 
-            if g_initial != 0:
-                delta_g_percent = (delta_g / g_initial) * 100
-            else:
-                delta_g_percent = float('nan')
+        if len(g_valid) < 2:
+            raise RuntimeError(
+                f"SRDP at {freq_hz:g} Hz returned {len(g_valid)} valid conductance "
+                "reading(s); at least the baseline and one pulse are needed. The "
+                "point is not recorded.")
 
-            # --- The DELIVERED frequency (audit H14) ---
-            #
-            # The requested frequency is not necessarily the one the device
-            # experienced. Whenever the requested period is shorter than the
-            # instrument can service — stimulus width, read delay, settle and
-            # ADC aperture all have to fit inside it — the LUA loop simply runs
-            # as fast as it can, and the warning above says so.
-            #
-            # This function used to record the NOMINAL frequency regardless. A
-            # user requesting 100 Hz against a true 62 Hz ceiling got a run at
-            # 62 Hz filed under 100 Hz, and since f0 and the slope are
-            # determined precisely where the ceiling starts to bite, the SRDP
-            # x-axis was wrong exactly where it mattered most.
-            #
-            # The instrument's own timestamps were being retrieved and thrown
-            # away. The mean inter-pulse interval over the train recovers the
-            # rate the device actually saw.
-            timestamps = np.asarray(pulse_results.get("time_s", []), dtype=float)
-            delivered_hz = freq_hz
-            if timestamps.size >= 3:
-                # Skip index 0: it is the pre-stimulus baseline read, not a
-                # pulse, so the 0->1 interval is not a pulse period.
-                intervals = np.diff(timestamps[1:])
-                intervals = intervals[np.isfinite(intervals) & (intervals > 0)]
-                if intervals.size:
-                    # Median rather than mean: robust to a single stalled
-                    # interval from a VISA hiccup.
-                    delivered_hz = 1.0 / float(np.median(intervals))
+        g_initial = g_valid[0]
+        g_final = g_valid[-1]
+        delta_g = g_final - g_initial
 
-            shortfall = (freq_hz - delivered_hz) / freq_hz * 100 if freq_hz else 0.0
-            if abs(shortfall) > 2.0:
-                print(f"  {freq_hz:.2f} Hz requested, {delivered_hz:.2f} Hz "
-                      f"delivered ({shortfall:+.1f}%). The DELIVERED rate is "
-                      "what is recorded.")
+        if g_initial != 0:
+            delta_g_percent = (delta_g / g_initial) * 100
+        else:
+            delta_g_percent = float('nan')
 
-            # Store results
+        # --- The DELIVERED frequency (audit H14) ---
+        #
+        # The requested frequency is not necessarily the one the device
+        # experienced. Whenever the requested period is shorter than the
+        # instrument can service — stimulus width, read delay, settle and
+        # ADC aperture all have to fit inside it — the LUA loop simply runs
+        # as fast as it can, and the warning above says so.
+        #
+        # This function used to record the NOMINAL frequency regardless. A
+        # user requesting 100 Hz against a true 62 Hz ceiling got a run at
+        # 62 Hz filed under 100 Hz, and since f0 and the slope are
+        # determined precisely where the ceiling starts to bite, the SRDP
+        # x-axis was wrong exactly where it mattered most.
+        #
+        # The instrument's own timestamps were being retrieved and thrown
+        # away. The mean inter-pulse interval over the train recovers the
+        # rate the device actually saw.
+        timestamps = np.asarray(pulse_results.get("time_s", []), dtype=float)
+        delivered_hz = freq_hz
+        frequency_source = "requested (fewer than 2 pulse intervals: delivered rate not measurable)"
+        if timestamps.size >= 3:
+            # Skip index 0: it is the pre-stimulus baseline read, not a
+            # pulse, so the 0->1 interval is not a pulse period.
+            intervals = np.diff(timestamps[1:])
+            intervals = intervals[np.isfinite(intervals) & (intervals > 0)]
+            if intervals.size:
+                # Median rather than mean: robust to a single stalled
+                # interval from a VISA hiccup.
+                delivered_hz = 1.0 / float(np.median(intervals))
+                frequency_source = "timestamps"
+
+        shortfall = (freq_hz - delivered_hz) / freq_hz * 100 if freq_hz else 0.0
+        if abs(shortfall) > 2.0:
+            print(f"  {freq_hz:.2f} Hz requested, {delivered_hz:.2f} Hz "
+                  f"delivered ({shortfall:+.1f}%). The DELIVERED rate is "
+                  "what is recorded.")
+
+        clipped = shortfall > SRDP_CLIP_TOLERANCE_PERCENT
+        if clipped:
+            saturated_at_hz = delivered_hz
+        if (clipped and last_delivered_hz is not None
+                and abs(delivered_hz - last_delivered_hz) / last_delivered_hz
+                < SRDP_SAME_RATE_TOLERANCE):
+            # Same delivered rate as the previous point: one operating point.
+            results["skipped_frequencies"].append(
+                {"requested_hz": freq_hz,
+                 "reason": f"delivered {delivered_hz:.4g} Hz, the same rate as the "
+                           "previous point"})
+        else:
             results["frequencies_hz"].append(delivered_hz)
             results["requested_frequencies_hz"].append(freq_hz)
             results["frequency_shortfall_percent"].append(shortfall)
+            results["frequency_source"].append(frequency_source)
             results["delta_g_S"].append(delta_g)
             results["delta_g_percent"].append(delta_g_percent)
             results["g_initial_S"].append(g_initial)
             results["g_final_S"].append(g_final)
+            results["execution_path"].append(pulse_results["execution_path"])
+            results["timing"].append(pulse_results.get("timing") or {"status": "not_recorded"})
+        last_delivered_hz = delivered_hz
 
         # Small delay between frequency measurements
         time.sleep(0.5)
 
+    if results["skipped_frequencies"]:
+        print("  SRDP: not measured -> "
+              + "; ".join(f"{s['requested_hz']:g} Hz ({s['reason']})"
+                          for s in results["skipped_frequencies"]))
+
     return results
+
+
+def _validate_stdp_sweep(params, delta_t_list_ms):
+    """Whole-sweep STDP validation. Touches no instrument.
+
+    Every spike pair must be physically producible, and that is decided for the
+    entire Δt list BEFORE the first pulse: the GUI defaults used to fail only at
+    the 7th point, after 6 sweeps had already stimulated the device. Collects
+    every violation so the user sees them together.
+    """
+    n_pairs = params.get('n_pulses', 50)
+    width = params['stim_width_ms']
+    period = params.get('stim_period_ms', 200)
+    problems = []
+    if int(n_pairs) != n_pairs or int(n_pairs) < 1:
+        problems.append(f"n_pulses (spike pairs) must be a whole number >= 1, got {n_pairs!r}")
+    if not (np.isfinite(width) and width > 0):
+        problems.append(f"stim_width_ms must be > 0, got {width!r}")
+    if not np.isfinite(period) or period <= 0:
+        problems.append(f"stim_period_ms must be > 0, got {period!r}")
+    if params.get('stim_drive_type', 'V') == 'I' and 'post_spike_level' not in params:
+        problems.append(
+            "stim_drive_type='I' needs an explicit post_spike_level in VOLTS: the "
+            "post-synaptic spike is always a voltage on the read channel, and "
+            "defaulting it to the stimulus level would apply amperes as volts")
+    if not len(delta_t_list_ms):
+        problems.append("the delta_t list is empty")
+    for dt in delta_t_list_ms:
+        if not np.isfinite(dt):
+            problems.append(f"delta_t = {dt!r} ms is not a finite time")
+        elif dt == 0:
+            problems.append("delta_t = 0 ms has no order (pre-before-post vs post-before-pre is undefined)")
+        elif abs(dt) < width:
+            problems.append(
+                f"|delta_t| = {abs(dt):g} ms is below the pulse width ({width:g} ms); delta_t "
+                "is onset-to-onset, so the spikes would have to overlap")
+        elif abs(dt) + width > period * (1 + 1e-12):
+            problems.append(
+                f"delta_t = {dt:g} ms with a {width:g} ms pulse needs {abs(dt) + width:g} ms per "
+                f"pair, longer than the pair period ({period:g} ms); the pair would run at "
+                f"{abs(dt) + width:g} ms, not {period:g} ms")
+    if problems:
+        raise ValueError("STDP sweep is not producible:\n  - " + "\n  - ".join(problems))
 
 
 def generate_stdp_lua_script(stim_ch, read_ch, params, delta_t_ms):
     """
     Generates LUA script for fast STDP spike-pair sequences.
     Executes entirely on instrument for deterministic millisecond-level timing.
+
+    The pre-synaptic spike is on stim_ch and honours stim_drive_type ('V' volts,
+    'I' amperes). The post-synaptic spike is always a VOLTAGE on read_ch.
 
     Args:
         stim_ch (str): Pre-synaptic channel ('smua' or 'smub')
@@ -3354,7 +4237,10 @@ def generate_stdp_lua_script(stim_ch, read_ch, params, delta_t_ms):
     Returns:
         str: LUA script for STDP measurement
     """
+    _validate_stdp_sweep(params, [delta_t_ms])
+
     # Extract parameters
+    drive = params.get('stim_drive_type', 'V')
     stim_level = params['stim_level']
     post_level = params.get('post_spike_level', stim_level)
     pulse_width_ms = params['stim_width_ms']
@@ -3363,8 +4249,11 @@ def generate_stdp_lua_script(stim_ch, read_ch, params, delta_t_ms):
     read_voltage = params['read_voltage']
     compliance_A = params['compliance_A']
     settle_ms = params.get('settle_ms', 5)
-    nplc = params.get('nplc', 0.1)
     line_freq_hz = _line_freq_hz(params)
+    # The shared averaging rule. This script used the raw nplc (default 0.1) and
+    # never wrote the filter, so it inherited whatever the previous run left:
+    # 25 ms reads instead of 7 ms.
+    nplc, measure_avg = derive_measurement_averaging(params)
 
     # Convert to seconds
     pulse_width_s = pulse_width_ms / 1000.0
@@ -3372,20 +4261,33 @@ def generate_stdp_lua_script(stim_ch, read_ch, params, delta_t_ms):
     pair_period_s = pair_period_ms / 1000.0
     settle_s = settle_ms / 1000.0
 
-    # Fixed range for speed (low-current regime)
-    def get_fixed_current_range(compliance_A):
-        ranges = [100e-12, 1e-9, 10e-9, 100e-9, 1e-6, 10e-6, 100e-6, 1e-3, 10e-3, 100e-3, 1.0, 3.0, 10.0]
-        for r in ranges:
-            if compliance_A <= r:
-                return r
-        return ranges[-1]
-
     fixed_i_range = get_fixed_current_range(compliance_A)
     max_voltage = params.get('max_voltage', 200.0)
     stim_v_range = _get_fixed_voltage_range(
         max(abs(stim_level), abs(post_level), abs(read_voltage)), max_voltage
     )
-    read_v_range = _get_fixed_voltage_range(read_voltage, max_voltage)
+    # The read channel also sources the post-synaptic spike, so its source range
+    # must hold post_level, not only the (typically 0.1 V) read voltage.
+    read_v_range = _get_fixed_voltage_range(max(abs(read_voltage), abs(post_level)), max_voltage)
+
+    if drive == 'V':
+        stim_attr = 'levelv'
+        stim_config = f"""{stim_ch}.source.func = {stim_ch}.OUTPUT_DCVOLTS
+{stim_ch}.source.rangev = {stim_v_range}
+{stim_ch}.source.levelv = 0
+{stim_ch}.source.limiti = {compliance_A}"""
+    else:
+        # A current spike: the range must contain |stim_level| and the
+        # compliance is a voltage. Writing levelv here applied 1 mA as 1 mV.
+        stim_attr = 'leveli'
+        stim_config = f"""{stim_ch}.source.func = {stim_ch}.OUTPUT_DCAMPS
+{stim_ch}.source.rangei = {_get_fixed_current_range(abs(stim_level))}
+{stim_ch}.source.leveli = 0
+{stim_ch}.source.limitv = {_current_drive_voltage_limit(params, 'STDP')}"""
+
+    settle_delay = lua_delay(settle_s, "settle_ms")   # delay(0) aborts a 2600 script
+    adc_setup = "\n".join(_emit_read_adc_setup(read_ch, nplc, measure_avg))
+    restore_adc = "\n".join(_emit_restore_adc(read_ch))
 
     # --- Delta_t convention (audit M28) ---
     #
@@ -3400,16 +4302,8 @@ def generate_stdp_lua_script(stim_ch, read_ch, params, delta_t_ms):
     # converting afterwards: the requested Delta_t stays onset-to-onset
     # everywhere, so the fitter, the learning rule and the exported data all
     # keep the one convention and nothing downstream needed re-validating.
+    # (|delta_t| >= pulse width is enforced by _validate_stdp_sweep.)
     inter_pulse_gap_s = abs(delta_t_s) - pulse_width_s
-    if inter_pulse_gap_s < 0:
-        raise ValueError(
-            f"STDP Delta_t = {delta_t_ms} ms is smaller than the pulse width "
-            f"({pulse_width_ms} ms). Delta_t is defined onset-to-onset, so the "
-            "two spikes would have to OVERLAP in time, which this sequential "
-            "pulse generator cannot produce.\n"
-            f"Either increase |Delta_t| above {pulse_width_ms} ms, or reduce "
-            "the pulse width."
-        )
 
     # Generate LUA script
     lua_script = f"""
@@ -3419,9 +4313,13 @@ def generate_stdp_lua_script(stim_ch, read_ch, params, delta_t_ms):
 -- Synchronise ADC to mains for normal-mode rejection of line-frequency pickup
 localnode.linefreq = {int(line_freq_hz)}
 
+-- The result globals are cleared FIRST. They persist on the instrument between
+-- scripts, so a run that dies before assigning them would otherwise leave the
+-- PREVIOUS delta_t point's readings for the host to collect as this point's.
+_stdp_i_initial = nil
+_stdp_i_final = nil
+
 -- Configuration
-local stim_ch = {stim_ch}
-local read_ch = {read_ch}
 local n_pairs = {n_pairs}
 local stim_level = {stim_level}
 local post_level = {post_level}
@@ -3431,13 +4329,9 @@ local pulse_width = {pulse_width_s}
 local inter_pulse_gap = {inter_pulse_gap_s}
 local pair_period = {pair_period_s}
 local read_voltage = {read_voltage}
-local settle_time = {settle_s}
 
 -- Configure channels with fixed ranges for speed
-{stim_ch}.source.func = {stim_ch}.OUTPUT_DCVOLTS
-{stim_ch}.source.rangev = {stim_v_range}
-{stim_ch}.source.levelv = 0
-{stim_ch}.source.limiti = {compliance_A}
+{stim_config}
 {stim_ch}.source.output = {stim_ch}.OUTPUT_OFF
 
 {read_ch}.source.func = {read_ch}.OUTPUT_DCVOLTS
@@ -3445,9 +4339,8 @@ local settle_time = {settle_s}
 {read_ch}.source.levelv = 0
 {read_ch}.source.limiti = {compliance_A}
 {read_ch}.measure.rangei = {fixed_i_range}
-{read_ch}.measure.autozero = {read_ch}.AUTOZERO_OFF
 {read_ch}.measure.autorangei = {read_ch}.AUTORANGE_OFF
-{read_ch}.measure.nplc = {nplc}
+{adc_setup}
 {read_ch}.source.output = {read_ch}.OUTPUT_OFF
 
 -- Turn on outputs at 0V (avoid relay toggling during spike pairs)
@@ -3457,13 +4350,15 @@ delay(0.01)
 
 -- Measure initial conductance
 {read_ch}.source.levelv = read_voltage
-delay(settle_time)
+{settle_delay}
 local I_initial = {read_ch}.measure.i()
 {read_ch}.source.levelv = 0
 
 -- STDP spike-pair loop (timer-based to prevent cumulative drift)
 timer.reset()
 local t_next = 0
+local overruns = 0
+local worst_overrun = 0
 for pair = 1, n_pairs do
     t_next = t_next + pair_period
 """
@@ -3471,9 +4366,9 @@ for pair = 1, n_pairs do
     if delta_t_ms >= 0:
         # Pre before Post (LTP)
         lua_script += f"""    -- Pre-spike (level change, no relay toggle)
-    {stim_ch}.source.levelv = stim_level
+    {stim_ch}.source.{stim_attr} = stim_level
     delay(pulse_width)
-    {stim_ch}.source.levelv = 0
+    {stim_ch}.source.{stim_attr} = 0
 
     -- Gap, so that post ONSET falls delta_t after pre ONSET
     if inter_pulse_gap > 0 then
@@ -3498,31 +4393,45 @@ for pair = 1, n_pairs do
     end
 
     -- Pre-spike (level change, no relay toggle)
-    {stim_ch}.source.levelv = stim_level
+    {stim_ch}.source.{stim_attr} = stim_level
     delay(pulse_width)
-    {stim_ch}.source.levelv = 0
+    {stim_ch}.source.{stim_attr} = 0
 """
 
     lua_script += f"""
-    -- Wait for next pair using absolute timer (prevents cumulative drift)
+    -- Wait for next pair using absolute timer (prevents cumulative drift).
+    -- A pair that outlasted its period has no remainder: it is counted and
+    -- reported, and t_next is re-baselined to now so the loop neither flags
+    -- every later pair nor fires them back to back to catch up.
     local t_remain = t_next - timer.measure.t()
-    if t_remain > 0 then delay(t_remain) end
+    if t_remain > 0 then
+        delay(t_remain)
+    else
+        overruns = overruns + 1
+        if -t_remain > worst_overrun then worst_overrun = -t_remain end
+        t_next = timer.measure.t()
+    end
 end
 
 -- Measure final conductance
 {read_ch}.source.levelv = read_voltage
-delay(settle_time)
+{settle_delay}
 local I_final = {read_ch}.measure.i()
 
 -- Cleanup
-{stim_ch}.source.levelv = 0
+{stim_ch}.source.{stim_attr} = 0
 {read_ch}.source.levelv = 0
 {stim_ch}.source.output = {stim_ch}.OUTPUT_OFF
 {read_ch}.source.output = {read_ch}.OUTPUT_OFF
 
+{restore_adc}
+
 -- Return results (stored in globals for retrieval)
 _stdp_i_initial = I_initial
 _stdp_i_final = I_final
+
+print(string.format("{LUA_TIMING_TOKEN} overruns=%d worst_ms=%.4f n_pulses=%d",
+                    overruns, worst_overrun * 1000, n_pairs))
 
 -- Completion token (host reads this to detect script end)
 print("{LUA_DONE_TOKEN}")
@@ -3531,29 +4440,49 @@ print("{LUA_DONE_TOKEN}")
     return lua_script
 
 
+def _read_stdp_results(instrument):
+    """(I_initial, I_final) from the script's globals, or LuaExecutionError.
+
+    The script clears both to nil before it does anything, so "nil" here means
+    this run did not produce the reading; it is never a previous point's value.
+    """
+    values = []
+    for name in ('_stdp_i_initial', '_stdp_i_final'):
+        raw = instrument.query(f"print({name})").strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            raise LuaExecutionError(f"{name} is {raw!r}: the script did not produce this reading") from None
+        # 9.91e37 is the 2600's overflow / not-a-number marker.
+        if not np.isfinite(value) or abs(value) >= 9.9e37:
+            raise LuaExecutionError(f"{name} = {raw}: the instrument returned an invalid reading")
+        values.append(value)
+    return tuple(values)
+
+
 def measure_stdp(instrument, stim_ch, read_ch, base_params, delta_t_list_ms):
     """
     Measures Spike-Timing-Dependent Plasticity (STDP).
-    
+
     Sweeps through different pre-post spike time differences (Δt) and measures
     the resulting conductance change to characterize timing-dependent learning.
-    
+
     Convention:
         - Δt > 0: Pre-spike before post-spike → typically LTP
         - Δt < 0: Post-spike before pre-spike → typically LTD
-    
+
     Implementation:
         - Pre-spike: Applied on stim_ch
         - Post-spike: Applied on read_ch (dual role: post-spike + readout)
         - Δt is controlled by delay between pre and post pulses
-    
+
     Args:
         instrument: PyVISA instrument resource
         stim_ch (str): Pre-synaptic stimulus channel ('smua' or 'smub')
         read_ch (str): Post-synaptic channel ('smua' or 'smub')
         base_params (dict): Base measurement parameters
         delta_t_list_ms (list): List of Δt values to test in milliseconds
-    
+
     Returns:
         dict: STDP results containing:
             - delta_t_ms: List of time differences
@@ -3561,10 +4490,21 @@ def measure_stdp(instrument, stim_ch, read_ch, base_params, delta_t_list_ms):
             - delta_g_percent: List of relative conductance changes
             - g_initial_S: List of initial conductances
             - g_final_S: List of final conductances
+            - execution_path / timing: one entry per point
             - base_params: Copy of base parameters
+
+    Raises:
+        ValueError: the sweep is not producible (nothing was touched).
+        LuaExecutionError: an on-instrument point failed. The outputs are OFF,
+            the points completed so far are on the exception as
+            `partial_results`, and the failed point is NOT recorded.
     """
     if stim_ch == read_ch:
         raise ValueError("Stim and Read channels must be different for STDP measurements")
+
+    # The whole Δt list is validated before any instrument access, queries
+    # included — see _validate_stdp_sweep.
+    _validate_stdp_sweep(base_params, delta_t_list_ms)
 
     # Adopt the instrument's auto-detected mains frequency unless overridden.
     resolve_line_freq(instrument, base_params)
@@ -3588,7 +4528,7 @@ def measure_stdp(instrument, stim_ch, read_ch, base_params, delta_t_list_ms):
                 f"ERROR: STDP stimulus level {stim_voltage}V exceeds instrument capability.\n"
                 f"Connected: {model} (Max: {max_voltage}V)"
             )
-    
+
     results = {
         "delta_t_ms": [],
         "delta_g_S": [],
@@ -3608,6 +4548,14 @@ def measure_stdp(instrument, stim_ch, read_ch, base_params, delta_t_list_ms):
     # Record instrument voltage ceiling so STDP LUA generation picks native ranges.
     base_params['max_voltage'] = get_max_voltage(instrument)
 
+    # The post-synaptic spike is a voltage on the read channel whatever the
+    # pre-synaptic drive is, so it is checked against the voltage ceiling too.
+    post_voltage = abs(base_params.get('post_spike_level', base_params['stim_level']))
+    if post_voltage > base_params['max_voltage']:
+        raise ValueError(
+            f"ERROR: STDP post-spike level {post_voltage}V exceeds the instrument "
+            f"ceiling ({base_params['max_voltage']}V)")
+
     # Check if instrument supports LUA for fast deterministic timing.
     #
     # H3: this used to be the loop's only gate, and the per-Δt exception
@@ -3618,9 +4566,26 @@ def measure_stdp(instrument, stim_ch, read_ch, base_params, delta_t_list_ms):
     # protocols with nothing recording which point came from which.
     #
     # `lua_supported` is now fixed for the sweep and a per-point decision is
-    # taken from it, so a failure at one Δt cannot affect the next.
+    # taken from it, so a failure at one Δt cannot affect the next. There is
+    # no fall-back from a failed LUA point at all: once its script has been
+    # sent the device may have been stimulated, and repeating the point on the
+    # host-timed path would both double-stimulate it and mix two protocols.
     lua_supported = supports_lua_execution(instrument)
     results["execution_path"] = []
+    results["timing"] = []
+
+    # measure.delay is 0 in the script, so the settle is the ONLY settling the
+    # read gets; whether it suffices for the range is recorded, not assumed.
+    settle_warning = check_read_settle(
+        base_params.get('settle_ms', 5) / 1000.0,
+        get_fixed_current_range(base_params['compliance_A']))
+    results["read_settle_warning"] = settle_warning
+    if settle_warning:
+        print(f"⚠️  STDP: {settle_warning}")
+
+    # print(number) honours format.asciiprecision (default 6 digits).
+    if lua_supported:
+        _set_ascii_precision(instrument)
 
     for delta_t_ms in delta_t_list_ms:
         use_lua = lua_supported
@@ -3628,77 +4593,56 @@ def measure_stdp(instrument, stim_ch, read_ch, base_params, delta_t_list_ms):
             # === FAST LUA PATH: Deterministic millisecond-level timing ===
             print(f"STDP Δt={delta_t_ms}ms: Using LUA for deterministic timing...")
 
+            # Generation only raises on a configuration error, which the
+            # standard path would hit too, so it is not guarded.
+            lua_script = generate_stdp_lua_script(stim_ch, read_ch, base_params, delta_t_ms)
+            n_pairs = base_params.get('n_pulses', 50)
+            pair_period_ms = base_params.get('stim_period_ms', 200)
+            estimated_time_s = (n_pairs * pair_period_ms) / 1000.0 + 2.0
+
             try:
-                # Generate and upload LUA script
-                lua_script = generate_stdp_lua_script(stim_ch, read_ch, base_params, delta_t_ms)
-
-                # Synchronize TSP, then load anonymous script
-                _safe_state(instrument)
-                instrument.write("loadandrunscript")
-                time.sleep(0.02)
-
-                # Upload script — concatenated for fewer VISA writes
-                script_lines = []
-                for line in lua_script.strip().split('\n'):
-                    line = line.strip()
-                    if line and not line.startswith('--'):
-                        script_lines.append(line)
-
-                chunk = []
-                chunk_size = 0
-                for line in script_lines:
-                    line_size = len(line) + 1
-                    if chunk_size + line_size > 512 and chunk:
-                        instrument.write('\n'.join(chunk))
-                        chunk = []
-                        chunk_size = 0
-                    chunk.append(line)
-                    chunk_size += line_size
-                if chunk:
-                    instrument.write('\n'.join(chunk))
-
-                # endscript triggers immediate execution for anonymous scripts
                 print("Executing STDP LUA script on instrument...")
-                instrument.write("endscript")
+                lua_timing = _upload_and_execute_lua(instrument, lua_script, estimated_time_s)
 
-                # Wait for completion via LUA_DONE_TOKEN (TSP-native,
-                # avoids *OPC? latching stalls on repeated runs).
-                n_pairs = base_params.get('n_pulses', 50)
-                pair_period_ms = base_params.get('stim_period_ms', 200)
-                estimated_time_s = (n_pairs * pair_period_ms) / 1000.0 + 2.0
-
-                try:
-                    _wait_lua_complete(instrument, estimated_time_s)
-                except Exception:
-                    print(f"  [LUA] completion token not received, waiting {estimated_time_s:.1f}s...")
-                    time.sleep(estimated_time_s)
-
-                # Retrieve results from global variables
-                I_initial = float(instrument.query("print(_stdp_i_initial)").strip())
-                I_final = float(instrument.query("print(_stdp_i_final)").strip())
-
-                # No cleanup needed — anonymous script (loadandrunscript) leaves no named artifact
-
-                # Calculate conductances. NaN at zero read bias, never 0 —
-                # see the execution-path parity invariant in CLAUDE.md.
-                read_voltage = base_params['read_voltage']
-                g_initial = I_initial / read_voltage if read_voltage != 0 else float('nan')
-                g_final = I_final / read_voltage if read_voltage != 0 else float('nan')
-
-                if g_initial and np.isfinite(g_initial) and g_initial != 0:
-                    print(f"  LUA execution complete: dG = "
-                          f"{((g_final - g_initial) / g_initial * 100):.2f}%")
-                else:
-                    print("  LUA execution complete")
-
+                errors = _read_error_queue(instrument)
+                if errors:
+                    raise LuaExecutionError(
+                        "the instrument reported error(s) during the script", [], errors)
+                I_initial, I_final = _read_stdp_results(instrument)
             except Exception as e:
-                # Scoped to THIS delta_t only — see the note on lua_supported.
-                print(f"  WARNING: LUA failed at delta_t={delta_t_ms} ms ({e}).")
-                print("  Falling back to the PC-timed path for this point only. "
-                      "Its spike timing is not instrument-controlled and Delta_t "
-                      "is therefore approximate; the point is stamped "
-                      "'standard' in results['execution_path'].")
-                use_lua = False  # Fall through to standard execution for this point
+                problem = _outputs_off(instrument)
+                queue = e.instrument_errors if isinstance(e, LuaExecutionError) and e.instrument_errors \
+                    else _read_error_queue(instrument)
+                fault = LuaExecutionError(
+                    f"STDP FAILED at delta_t = {delta_t_ms} ms ({e}).\n"
+                    f"  Outputs: {problem or 'switched OFF'}\n"
+                    f"  Instrument error queue: {queue if queue else 'empty'}\n"
+                    f"  {len(results['delta_t_ms'])} earlier point(s) are on this exception as "
+                    "`partial_results`; this point is NOT recorded and was NOT repeated on "
+                    "another path, because the device may already have been stimulated.",
+                    instrument_errors=queue)
+                fault.partial_results = results
+                raise fault from e
+
+            lua_timing = dict(lua_timing)
+            lua_timing['requested_pair_period_ms'] = pair_period_ms
+
+            # Calculate conductances. NaN at zero read bias, never 0 —
+            # see the execution-path parity invariant in CLAUDE.md.
+            read_voltage = base_params['read_voltage']
+            g_initial = I_initial / read_voltage if read_voltage != 0 else float('nan')
+            g_final = I_final / read_voltage if read_voltage != 0 else float('nan')
+
+            if g_initial and np.isfinite(g_initial) and g_initial != 0:
+                print(f"  LUA execution complete: dG = "
+                      f"{((g_final - g_initial) / g_initial * 100):.2f}%")
+            else:
+                print("  LUA execution complete")
+            if lua_timing.get('overruns'):
+                print(f"⚠️  {int(lua_timing['overruns'])}/{n_pairs} spike pairs could NOT keep the "
+                      f"{pair_period_ms:g} ms pair period (worst shortfall "
+                      f"{lua_timing.get('worst_ms', float('nan')):.3f} ms).")
+            point_timing = lua_timing
 
         if not use_lua:
             # === STANDARD PATH: Python-controlled timing ===
@@ -3721,87 +4665,104 @@ def measure_stdp(instrument, stim_ch, read_ch, base_params, delta_t_list_ms):
             delta_t_s = delta_t_ms / 1000.0
             read_voltage = base_params['read_voltage']
             post_level = base_params.get('post_spike_level', base_params['stim_level'])
+            stim_attr = 'levelv' if base_params.get('stim_drive_type', 'V') == 'V' else 'leveli'
 
-            # NPLC from the shared derivation, not a hardcoded 0.1 that
-            # discarded whatever the GUI asked for.
-            nplc_std, _ = derive_measurement_averaging(base_params)
+            # NPLC and averaging from the shared derivation, not a hardcoded 0.1
+            # that discarded whatever the GUI asked for.
+            nplc_std, avg_std = derive_measurement_averaging(base_params)
 
             # Configure channels
             instrument.write(f"localnode.linefreq = {int(_line_freq_hz(base_params))}")
-            instrument.write(f"{stim_ch}.source.func = {stim_ch}.OUTPUT_DCVOLTS")
-            instrument.write(f"{stim_ch}.source.limiti = {base_params['compliance_A']}")
-            instrument.write(f"{stim_ch}.source.levelv = 0")
+            if stim_attr == 'levelv':
+                instrument.write(f"{stim_ch}.source.func = {stim_ch}.OUTPUT_DCVOLTS")
+                instrument.write(f"{stim_ch}.source.limiti = {base_params['compliance_A']}")
+            else:
+                instrument.write(f"{stim_ch}.source.func = {stim_ch}.OUTPUT_DCAMPS")
+                instrument.write(f"{stim_ch}.source.rangei = "
+                                 f"{_get_fixed_current_range(abs(base_params['stim_level']))}")
+                instrument.write(f"{stim_ch}.source.limitv = "
+                                 f"{_current_drive_voltage_limit(base_params, 'STDP')}")
+            instrument.write(f"{stim_ch}.source.{stim_attr} = 0")
             instrument.write(f"{read_ch}.source.func = {read_ch}.OUTPUT_DCVOLTS")
             instrument.write(f"{read_ch}.source.limiti = {base_params['compliance_A']}")
             instrument.write(f"{read_ch}.source.levelv = 0")
-            instrument.write(f"{read_ch}.measure.nplc = {nplc_std}")
+            try:
+                for line in _emit_read_adc_setup(read_ch, nplc_std, avg_std):
+                    instrument.write(line)
 
-            # Outputs on once, for the whole point — no relay activity inside
-            # the timing-critical pair loop.
-            instrument.write(f"{stim_ch}.source.output = {stim_ch}.OUTPUT_ON")
-            instrument.write(f"{read_ch}.source.output = {read_ch}.OUTPUT_ON")
+                # Outputs on once, for the whole point — no relay activity inside
+                # the timing-critical pair loop.
+                instrument.write(f"{stim_ch}.source.output = {stim_ch}.OUTPUT_ON")
+                instrument.write(f"{read_ch}.source.output = {read_ch}.OUTPUT_ON")
 
-            def _read_g():
-                instrument.write(f"{read_ch}.source.levelv = {read_voltage}")
-                time.sleep(settle_ms / 1000.0)
-                current = float(instrument.query(f"print({read_ch}.measure.i())").strip())
-                instrument.write(f"{read_ch}.source.levelv = 0")
-                # NaN at zero read bias, never a fabricated 0.
-                return (current / read_voltage) if read_voltage != 0 else float('nan')
-
-            # Measure initial conductance
-            g_initial = _read_g()
-
-            # Delta_t is ONSET-TO-ONSET, matching the LUA path and the spec —
-            # see the note in generate_stdp_lua_script (M28). The silent gap
-            # between the pulses is therefore |Delta_t| minus one pulse width.
-            inter_pulse_gap_s = abs(delta_t_s) - pulse_width_s
-            if inter_pulse_gap_s < 0:
-                raise ValueError(
-                    f"STDP Delta_t = {delta_t_ms} ms is smaller than the pulse "
-                    f"width ({base_params['stim_width_ms']} ms). Delta_t is "
-                    "defined onset-to-onset, so the spikes would have to "
-                    "overlap, which this sequential generator cannot produce."
-                )
-
-            # Apply spike pairs
-            for pair_idx in range(n_pairs):
-                if delta_t_ms >= 0:
-                    # Pre before post
-                    instrument.write(f"{stim_ch}.source.levelv = {base_params['stim_level']}")
-                    time.sleep(pulse_width_s)
-                    instrument.write(f"{stim_ch}.source.levelv = 0")
-
-                    if inter_pulse_gap_s > 0:
-                        time.sleep(inter_pulse_gap_s)
-
-                    instrument.write(f"{read_ch}.source.levelv = {post_level}")
-                    time.sleep(pulse_width_s)
+                def _read_g():
+                    instrument.write(f"{read_ch}.source.levelv = {read_voltage}")
+                    time.sleep(settle_ms / 1000.0)
+                    current = float(instrument.query(f"print({read_ch}.measure.i())").strip())
                     instrument.write(f"{read_ch}.source.levelv = 0")
-                else:
-                    # Post before pre
-                    instrument.write(f"{read_ch}.source.levelv = {post_level}")
-                    time.sleep(pulse_width_s)
-                    instrument.write(f"{read_ch}.source.levelv = 0")
+                    # NaN at zero read bias, never a fabricated 0.
+                    return (current / read_voltage) if read_voltage != 0 else float('nan')
 
-                    if inter_pulse_gap_s > 0:
-                        time.sleep(inter_pulse_gap_s)
+                # Measure initial conductance
+                g_initial = _read_g()
 
-                    instrument.write(f"{stim_ch}.source.levelv = {base_params['stim_level']}")
-                    time.sleep(pulse_width_s)
-                    instrument.write(f"{stim_ch}.source.levelv = 0")
+                # Delta_t is ONSET-TO-ONSET, matching the LUA path and the spec —
+                # see the note in generate_stdp_lua_script (M28). The silent gap
+                # between the pulses is therefore |Delta_t| minus one pulse width.
+                inter_pulse_gap_s = abs(delta_t_s) - pulse_width_s
+                if inter_pulse_gap_s < 0:
+                    raise ValueError(
+                        f"STDP Delta_t = {delta_t_ms} ms is smaller than the pulse "
+                        f"width ({base_params['stim_width_ms']} ms). Delta_t is "
+                        "defined onset-to-onset, so the spikes would have to "
+                        "overlap, which this sequential generator cannot produce."
+                    )
 
-                time.sleep(pair_period_ms / 1000.0)
+                # Apply spike pairs
+                for pair_idx in range(n_pairs):
+                    if delta_t_ms >= 0:
+                        # Pre before post
+                        instrument.write(f"{stim_ch}.source.{stim_attr} = {base_params['stim_level']}")
+                        time.sleep(pulse_width_s)
+                        instrument.write(f"{stim_ch}.source.{stim_attr} = 0")
 
-            # Measure final conductance
-            g_final = _read_g()
+                        if inter_pulse_gap_s > 0:
+                            time.sleep(inter_pulse_gap_s)
 
-            instrument.write(f"{stim_ch}.source.output = {stim_ch}.OUTPUT_OFF")
-            instrument.write(f"{read_ch}.source.output = {read_ch}.OUTPUT_OFF")
+                        instrument.write(f"{read_ch}.source.levelv = {post_level}")
+                        time.sleep(pulse_width_s)
+                        instrument.write(f"{read_ch}.source.levelv = 0")
+                    else:
+                        # Post before pre
+                        instrument.write(f"{read_ch}.source.levelv = {post_level}")
+                        time.sleep(pulse_width_s)
+                        instrument.write(f"{read_ch}.source.levelv = 0")
+
+                        if inter_pulse_gap_s > 0:
+                            time.sleep(inter_pulse_gap_s)
+
+                        instrument.write(f"{stim_ch}.source.{stim_attr} = {base_params['stim_level']}")
+                        time.sleep(pulse_width_s)
+                        instrument.write(f"{stim_ch}.source.{stim_attr} = 0")
+
+                    time.sleep(pair_period_ms / 1000.0)
+
+                # Measure final conductance
+                g_final = _read_g()
+
+                instrument.write(f"{stim_ch}.source.output = {stim_ch}.OUTPUT_OFF")
+                instrument.write(f"{read_ch}.source.output = {read_ch}.OUTPUT_OFF")
+                point_timing = {'status': 'host_clock',
+                                'reason': 'PC-timed path: spike timing is not measured by the instrument'}
+            finally:
+                # put back the measure.delay / autozero the setup saved
+                for line in _emit_restore_adc(read_ch):
+                    instrument.write(line)
 
         # Provenance for this point: LUA timing and host timing are not the
         # same measurement, and an array that mixes them must say so.
         results["execution_path"].append('lua' if use_lua else 'standard')
+        results["timing"].append(point_timing)
 
         # Calculate and store results
         delta_g = g_final - g_initial
@@ -3907,6 +4868,10 @@ def measure_retention(instrument, read_ch, params):
     settle_ms = params.get('settle_ms', 5)
     nplc = params.get('nplc', 1.0)
     
+    _check_times_ms(nonneg={'settle_ms': settle_ms,
+                            **{f'retention_times_s[{i}] (ms)': t * 1000.0
+                               for i, t in enumerate(retention_times)}})
+
     # Configure sense mode if specified
     _apply_wire_modes(instrument, params, [read_ch])
 
@@ -3918,8 +4883,14 @@ def measure_retention(instrument, read_ch, params):
     # Configure read channel for retention measurement
     instrument.write(f"{read_ch}.source.func = {read_ch}.OUTPUT_DCVOLTS")
     instrument.write(f"{read_ch}.source.limiti = {compliance_A}")
+    # Autorange is kept deliberately: the signal decays over decades, so no
+    # single fixed range suits every point. With autorange the range can change
+    # right before a read, so the instrument's own range-dependent DELAY_AUTO
+    # is the settling that read needs; retention reads are seconds apart, so
+    # its cost is irrelevant here (unlike the pulse paths, which set delay 0).
     instrument.write(f"{read_ch}.measure.autorangei = {read_ch}.AUTORANGE_ON")
-    instrument.write(f"{read_ch}.measure.nplc = {nplc}")
+    for line in _emit_read_adc_setup(read_ch, nplc, 1, measure_delay="auto"):
+        instrument.write(line)
     
     print(f"\n=== Retention Measurement Started ===")
     print(f"Sample: {params.get('sample_id', 'unknown')}")
@@ -3935,7 +4906,10 @@ def measure_retention(instrument, read_ch, params):
         print(f"  Waiting {t_wait}s...", end=" ", flush=True)
         time.sleep(t_wait)
         
-        # Measure conductance
+        # Measure conductance. The reads are minutes apart, so the zero
+        # reference is refreshed before each one (AUTOZERO_ONCE costs two
+        # conversions; a cached zero drifts with temperature over that time).
+        instrument.write(f"{read_ch}.measure.autozero = {read_ch}.AUTOZERO_ONCE")
         instrument.write(f"{read_ch}.source.levelv = {read_voltage}")
         instrument.write(f"{read_ch}.source.output = {read_ch}.OUTPUT_ON")
         time.sleep(settle_ms / 1000.0)
@@ -3943,10 +4917,11 @@ def measure_retention(instrument, read_ch, params):
         # Measure current
         I_measured = float(instrument.query(f"print({read_ch}.measure.i())").strip())
         
-        # Calculate conductance
-        G_measured = I_measured / read_voltage if read_voltage != 0 else 0
+        # Conductance is undefined at zero read bias: NaN, never a fabricated 0
+        G_measured = I_measured / read_voltage if read_voltage != 0 else float('nan')
         
-        # Turn off output
+        # Level to 0 BEFORE the output goes off
+        instrument.write(f"{read_ch}.source.levelv = 0")
         instrument.write(f"{read_ch}.source.output = {read_ch}.OUTPUT_OFF")
         
         # Calculate elapsed time from start
@@ -3959,11 +4934,18 @@ def measure_retention(instrument, read_ch, params):
         
         # Display progress
         print(f"G = {G_measured*1e6:.2f} µS (t = {t_elapsed:.1f}s)")
-    
+
+    for line in _emit_restore_adc(read_ch):
+        instrument.write(line)
+
     print(f"\n✓ Retention measurement complete!")
-    print(f"  Initial G: {results['conductance_S'][0]*1e6:.2f} µS")
-    print(f"  Final G: {results['conductance_S'][-1]*1e6:.2f} µS")
-    print(f"  Decay: {(1 - results['conductance_S'][-1]/results['conductance_S'][0])*100:.1f}%")
+    G_first, G_last = results['conductance_S'][0], results['conductance_S'][-1]
+    print(f"  Initial G: {G_first*1e6:.2f} µS")
+    print(f"  Final G: {G_last*1e6:.2f} µS")
+    if np.isfinite(G_first) and np.isfinite(G_last) and G_first != 0:
+        print(f"  Decay: {(1 - G_last/G_first)*100:.1f}%")
+    else:
+        print("  Decay: not defined (initial conductance is NaN or zero)")
     
     return results
 

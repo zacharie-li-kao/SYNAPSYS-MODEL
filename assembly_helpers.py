@@ -126,8 +126,234 @@ def compute_derived_metrics(x_data: np.ndarray, y_data: np.ndarray,
 
 
 # =============================================================================
+# PER-RUN METADATA AND RUN CLASSIFICATION
+# =============================================================================
+#
+# Every stored run carries the parameters it was measured with. A suite used to
+# be stamped with ONE stimulus block taken from the first run and applied to all
+# of them, so a sweep measured at 10/20/30 mW/cm2 exported at 30 throughout and
+# an electrical LTD run was exported as light at 650 nm. Metadata is now derived
+# from each run itself; a shared `stimulus_params` is only a base for keys the
+# run does not carry.
+
+_LIGHT_MODES = ('visual',)                                   # SMU drives an LED
+_ELECTRICAL_MODES = ('electrical', 'memristor_pulse', 'srdp', 'stdp')
+_PULSE_MODES = ('electrical', 'visual', 'memristor_pulse')
+_NON_STIMULUS_MODES = ('retention',)                         # read-only sequence
+
+
+def run_params(result: Dict) -> Dict:
+    """The parameter dict a stored run carries ({} when it carries none)."""
+    for key in ('params', 'base_params'):
+        if isinstance(result.get(key), dict):
+            return result[key]
+    return {}
+
+
+def stimulus_params_from_params(p: Dict, stimulus_type: Optional[str] = None) -> Dict:
+    """Stimulus metadata for ONE run, from the parameters it was measured with.
+
+    Only what the run recorded is returned; an absent value stays absent so the
+    fitter can report it, rather than being filled with a plausible number.
+    Wavelength and intensity are written only for an optical stimulus: for an
+    electrical run they would be a "manual light" note that the spectral fit
+    (which groups every potentiation/depression dataset by wavelength) would
+    take for the driving wavelength.
+
+    Raises ValueError on a mode that is not a canonical engine mode.
+    """
+    out: Dict = {}
+    mode = p.get('mode')
+    if stimulus_type is None and mode:
+        if mode in _LIGHT_MODES:
+            stimulus_type = 'light'
+        elif mode in _ELECTRICAL_MODES:
+            stimulus_type = 'electrical'
+        elif mode not in _NON_STIMULUS_MODES:
+            raise ValueError(
+                f"Unrecognised measurement mode {mode!r}; expected one of "
+                f"{_PULSE_MODES + ('srdp', 'stdp', 'retention')}."
+            )
+    if stimulus_type is not None:
+        out['stimulus_type'] = stimulus_type
+    if stimulus_type == 'light':
+        if p.get('wavelength_nm') is not None:
+            out['wavelength_nm'] = p['wavelength_nm']
+        if p.get('intensity_mW_cm2') is not None:
+            out['light_intensity_mW_cm2'] = p['intensity_mW_cm2']
+    width = p.get('stim_width_ms', p.get('pulse_width_ms'))
+    if width is not None:
+        out['pulse_width_ms'] = width
+    period = p.get('stim_period_ms', p.get('pulse_period_ms'))
+    if period:
+        out['pulse_period_ms'] = period
+        out['frequency_Hz'] = 1000.0 / period
+    if p.get('n_pulses') is not None:
+        out['n_pulses'] = p['n_pulses']
+    return out
+
+
+def stimulus_params_from_run(result: Dict) -> Dict:
+    return stimulus_params_from_params(run_params(result))
+
+
+def _resolve_params(shared: Optional[Dict], result: Dict,
+                    explicit: Optional[Dict] = None) -> Dict:
+    """shared base  <  the run's own parameters  <  explicit per-result override."""
+    merged = dict(shared or {})
+    merged.update(stimulus_params_from_run(result))
+    merged.update(explicit or {})
+    return merged
+
+
+def run_sample_id(result: Dict) -> Optional[str]:
+    """The sample ID a run was measured under, or None when it recorded none."""
+    for holder in (result.get('metadata'), run_params(result), result.get('pot_params')):
+        sid = holder.get('sample_id') if isinstance(holder, dict) else None
+        if sid and sid != 'unknown':
+            return sid
+    return None
+
+
+def classify_run(result: Dict) -> str:
+    """Kind of a stored run, from what it actually contains (not from its length)."""
+    if 'devices' in result:
+        return 'multi_device'
+    if 'cycles' in result:
+        return 'cycles'
+    if 'frequencies_hz' in result:
+        return 'srdp'
+    if 'delta_t_ms' in result:
+        return 'stdp'
+    if 'Jsc_A' in result:
+        return 'visual_jsc'
+    mode = run_params(result).get('mode')
+    if mode == 'retention' or result.get('metadata', {}).get('measurement_type') == 'retention':
+        return 'retention'
+    if 'conductance_S' in result and ('pulse_number' in result or mode in _PULSE_MODES):
+        return 'pulse'
+    return 'unknown'
+
+
+# Which kinds of run each suite slot can take. A Visual (Jsc) run has no
+# conductance, so it fits no slot; a retention trace is not a pulse train.
+ROLE_KINDS = {
+    'ltp': ('pulse',), 'ltd': ('pulse',), 'cycles': ('cycles',),
+    'retention': ('retention',), 'stdp': ('stdp',), 'srdp': ('srdp',),
+}
+
+
+def check_role(result: Dict, role: str) -> Optional[str]:
+    """None if `result` can fill suite slot `role`, else the reason it cannot."""
+    kind = classify_run(result)
+    if kind in ROLE_KINDS[role]:
+        return None
+    reason = {
+        'visual_jsc': "a Visual (self-powered) run records photocurrent Jsc, not conductance",
+        'multi_device': "a multi-device run holds several devices; a suite describes one device",
+        'unknown': "its contents are not recognised as a measurement",
+    }.get(kind, f"it is a {kind} run")
+    return (f"This run cannot be used as {role.upper()}: {reason}. "
+            f"{role.upper()} needs a {' / '.join(ROLE_KINDS[role])} run.")
+
+
+def run_branch(result: Dict) -> Optional[str]:
+    """'potentiation', 'depression' or 'flat' from the run's own conductance
+    (None when it has too few finite points to say)."""
+    g = np.asarray(result.get('conductance_S', []), dtype=float)
+    g = g[np.isfinite(g)]
+    if g.size < 2:
+        return None
+    return {1: 'potentiation', -1: 'depression', 0: 'flat'}[int(np.sign(g[-1] - g[0]))]
+
+
+def describe_run(result: Dict) -> str:
+    """One-line description of a run by what it is, for selection lists."""
+    kind = classify_run(result)
+    p = run_params(result)
+    sid = run_sample_id(result)
+    tail = f" | sample {sid}" if sid else ""
+    if kind == 'cycles':
+        return f"Pot-Dep cycles ({len(result['cycles'])} cycle(s)){tail}"
+    if kind == 'multi_device':
+        return f"Multi-device cycles ({len(result['devices'])} devices){tail}"
+    if kind == 'srdp':
+        return f"SRDP ({len(result['frequencies_hz'])} frequency points){tail}"
+    if kind == 'stdp':
+        return f"STDP ({len(result['delta_t_ms'])} timing points){tail}"
+    if kind == 'visual_jsc':
+        return f"Visual Jsc ({len(result['Jsc_A'])} points) - not exportable to a suite{tail}"
+    if kind == 'retention':
+        return f"Retention ({len(result['conductance_S'])} time points){tail}"
+    if kind == 'pulse':
+        mode = p.get('mode', 'pulse-read')
+        n = len(result['conductance_S'])
+        branch = run_branch(result)
+        level = f" | {p['stim_level']:g} {p.get('stim_drive_type', 'V')}" \
+            if p.get('stim_level') is not None else ""
+        wl = f" | {p['wavelength_nm']:g} nm @ {p['intensity_mW_cm2']:g} mW/cm2" \
+            if mode in _LIGHT_MODES and p.get('wavelength_nm') is not None \
+            and p.get('intensity_mW_cm2') is not None else ""
+        return f"{mode} pulse-read ({n} points, net {branch or 'n/a'}){level}{wl}{tail}"
+    return f"Unrecognised measurement{tail}"
+
+
+def detect_wavelength_sweep(runs: List[Dict]):
+    """Find a wavelength sweep among stored runs.
+
+    Only optical pulse-read runs qualify (an electrical run's "manual light"
+    wavelength is not a stimulus). Results and wavelengths are returned sorted
+    jointly by wavelength so the pairing is independent of measurement order.
+    One run is kept per wavelength.
+
+    Returns (results, wavelengths, skipped_duplicates); (None, None, skipped)
+    when fewer than 3 distinct wavelengths were measured.
+    """
+    by_wl: Dict[float, Dict] = {}
+    skipped = 0
+    for r in runs:
+        if classify_run(r) != 'pulse':
+            continue
+        sp = stimulus_params_from_run(r)
+        if sp.get('stimulus_type') != 'light' or 'wavelength_nm' not in sp:
+            continue
+        if sp['wavelength_nm'] in by_wl:
+            skipped += 1
+        else:
+            by_wl[sp['wavelength_nm']] = r
+    if len(by_wl) < 3:
+        return None, None, skipped
+    ordered = sorted(by_wl.items(), key=lambda kv: kv[0])
+    return [r for _, r in ordered], [wl for wl, _ in ordered], skipped
+
+
+# =============================================================================
 # DATASET CONVERSION FUNCTIONS
 # =============================================================================
+
+def _add_stimulus_metadata(metadata: Dict, sp: Dict, wavelength_key: str) -> None:
+    """Copy the stimulus conditions present in `sp` into dataset metadata."""
+    # The wavelength is filed under the key matching the branch it drove; a
+    # depression run's wavelength under 'wavelength_pot' mislabels the band and
+    # the spectral fit cannot detect it. Legacy spellings are accepted so suites
+    # from an older build still convert.
+    _wl = sp.get('wavelength_nm', sp.get('wavelength_pot', sp.get('wavelength_dep')))
+    if _wl is not None:
+        metadata[wavelength_key] = _wl
+    # Absent stays absent: an electrical run legitimately has no wavelength, and
+    # fitting.py reports the absence in its extraction report.
+
+    # Under the unit-bearing key fitting.py reads; the unit-less 'intensity' is
+    # accepted on input and kept on output for older readers.
+    _intensity = sp.get('light_intensity_mW_cm2', sp.get('intensity'))
+    if _intensity is not None:
+        metadata['light_intensity_mW_cm2'] = _intensity
+        metadata['intensity'] = _intensity
+    for key in ('pulse_width_ms', 'pulse_period_ms', 'frequency_Hz', 'n_pulses',
+                'read_timing_ms'):
+        if key in sp:
+            metadata[key] = sp[key]
+
 
 def convert_pulse_sequence_to_dataset(result: Dict, experiment_type: str, 
                                      stimulus_params: Dict,
@@ -190,55 +416,22 @@ def convert_pulse_sequence_to_dataset(result: Dict, experiment_type: str,
     y_type = 'conductance'
     y_units = 'S'
     
-    # Build metadata
+    # Build metadata. stimulus_type is recorded only when known: defaulting to
+    # 'light' stamped optical provenance on runs that never had any.
     metadata = {
         'x_type': x_type,
         'x_units': x_units,
         'y_type': y_type,
         'y_units': y_units,
         'experiment_type': experiment_type,
-        'stimulus_type': stimulus_params.get('stimulus_type', 'light'),
         'notes': stimulus_params.get('notes', '')
     }
-    
-    # Add stimulus parameters.
-    #
-    # The wavelength is filed under the key matching the branch it drove.
-    # Writing a depression run's wavelength under 'wavelength_pot' — which is
-    # what happened unconditionally before — mislabels the band, and the
-    # spectral fit has no way to detect it.
-    #
-    # Legacy spellings are accepted so suites exported by an older build still
-    # convert, but the canonical producer key is 'wavelength_nm'.
-    _wl = stimulus_params.get('wavelength_nm',
-                              stimulus_params.get('wavelength_pot',
-                                                  stimulus_params.get('wavelength_dep')))
-    if _wl is not None:
-        wl_key = 'wavelength_dep' if experiment_type == 'depression' else 'wavelength_pot'
-        metadata[wl_key] = _wl
-    # No wavelength is left ABSENT, never defaulted: an electrical cycle
-    # legitimately has none, and stamping 550/365 would invent a measurement.
-    # fitting.py already reports the absence explicitly in its extraction
-    # report, so the omission is flagged rather than silent.
+    if 'stimulus_type' in stimulus_params:
+        metadata['stimulus_type'] = stimulus_params['stimulus_type']
+    _add_stimulus_metadata(
+        metadata, stimulus_params,
+        'wavelength_dep' if experiment_type == 'depression' else 'wavelength_pot')
 
-    # Intensity, under the unit-bearing key fitting.py actually reads. The old
-    # unit-less 'intensity' was written and never consumed, so A_peak/B_peak
-    # extraction aborted for want of a value the user had supplied.
-    _intensity = stimulus_params.get('light_intensity_mW_cm2',
-                                     stimulus_params.get('intensity'))
-    if _intensity is not None:
-        metadata['light_intensity_mW_cm2'] = _intensity
-        # Retained for backward compatibility with older readers.
-        metadata['intensity'] = _intensity
-    if 'pulse_width_ms' in stimulus_params:
-        metadata['pulse_width_ms'] = stimulus_params['pulse_width_ms']
-    if 'frequency_Hz' in stimulus_params:
-        metadata['frequency_Hz'] = stimulus_params['frequency_Hz']
-    if 'n_pulses' in stimulus_params:
-        metadata['n_pulses'] = stimulus_params['n_pulses']
-    if 'read_timing_ms' in stimulus_params:
-        metadata['read_timing_ms'] = stimulus_params['read_timing_ms']
-    
     # Compute derived metrics
     x_array = np.array(x_data)
     y_array = np.array(y_data)
@@ -258,113 +451,108 @@ def convert_pulse_sequence_to_dataset(result: Dict, experiment_type: str,
 
 
 def convert_wavelength_sweep(results_list: List[Dict], wavelengths: List[float],
-                            stimulus_params: Dict) -> List[Dict]:
+                            stimulus_params: Dict,
+                            per_result_params: Optional[List[Dict]] = None) -> List[Dict]:
     """
     Convert wavelength sweep results into multiple datasets (one per wavelength).
-    
+
     Args:
         results_list: List of pulse_read_sequence results, one per wavelength
         wavelengths: Corresponding wavelength values (nm)
-        stimulus_params: Base stimulus parameters (intensity, pulse_width, etc.)
-    
+        stimulus_params: Shared base parameters; each run's own recorded
+            parameters (intensity, pulse width, ...) take precedence, so a
+            sweep measured at several intensities keeps each one.
+        per_result_params: Optional explicit overrides, one dict per result.
+
     Returns:
         list: List of datasets, one per wavelength
     """
     if len(results_list) != len(wavelengths):
         raise ValueError("Number of results must match number of wavelengths")
-    
+    if per_result_params is not None and len(per_result_params) != len(results_list):
+        raise ValueError("per_result_params must have one entry per result")
+
     datasets = []
-    for result, wl in zip(results_list, wavelengths):
-        params = stimulus_params.copy()
+    for i, (result, wl) in enumerate(zip(results_list, wavelengths)):
+        params = _resolve_params(stimulus_params, result,
+                                 per_result_params[i] if per_result_params else None)
         params['wavelength_nm'] = wl
-        
+
         dataset = convert_pulse_sequence_to_dataset(
-            result, 
+            result,
             'potentiation',
             params,
             f"wavelength_{wl}nm"
         )
-        
+
         datasets.append(dataset)
-    
+
     return datasets
+
+
+def _cycle_phase_params(shared: Dict, cfg: Optional[Dict], phase_data: Dict,
+                        short: str, notes: str) -> Dict:
+    """Stimulus metadata for one cycle phase (short = 'pot' or 'dep').
+
+    The train's own config is the source: its real pulse width and pulse count,
+    an electrical stimulus type (a cycle train is a voltage write pulse), and no
+    intensity unless one was actually recorded. The legacy shared keys
+    (`wavelength_pot`, `intensity_dep`, ...) are honoured when the caller
+    supplies them; nothing is invented when they are absent.
+    """
+    out: Dict = {'notes': notes}
+    for src, dst in (('stimulus_type', 'stimulus_type'),
+                     (f'wavelength_{short}', 'wavelength_nm'),
+                     (f'intensity_{short}', 'light_intensity_mW_cm2'),
+                     ('pulse_width_ms', 'pulse_width_ms')):
+        if shared.get(src) is not None:
+            out[dst] = shared[src]
+    if cfg:
+        out.update(stimulus_params_from_params(cfg, stimulus_type='electrical'))
+    if 'n_pulses' not in out:
+        # pulse_number index 0 is the pre-stimulus baseline, so the pulse count
+        # is one less than the number of points.
+        pn = phase_data.get('pulse_number')
+        if pn is not None and len(pn) and pn[0] == 0:
+            out['n_pulses'] = len(pn) - 1
+    return out
 
 
 def convert_cycle_to_datasets(cycle_results: Dict, stimulus_params: Dict) -> List[Dict]:
     """
     Convert potentiation-depression cycling data into separate datasets.
-    
+
     Args:
-        cycle_results: Output from synapse_cycle.run_potentiation_depression_cycle()
-        stimulus_params: Dict with pot and dep wavelengths, intensities, etc.
-    
+        cycle_results: Output from synapse_cycle.cycle_sequence(); its
+            `pot_params` / `dep_params` (Train A / Train B configs) supply each
+            phase's real pulse width, pulse count, period and stimulus type.
+        stimulus_params: Optional shared values (`wavelength_pot`,
+            `intensity_dep`, ...) for results that carry no train config.
+
     Returns:
         list: List of datasets (separate for each potentiation and depression phase)
     """
     datasets = []
-    
+    shared = stimulus_params or {}
+
     for cycle_idx, cycle in enumerate(cycle_results['cycles']):
-        # Potentiation phase
-        if 'potentiation' in cycle and cycle['potentiation'] is not None:
-            pot_data = cycle['potentiation']
-            
-            # No hardcoded wavelength fallback. A cycle exported without a
-            # recorded potentiation wavelength used to be silently stamped
-            # 550 nm, which then entered the spectral fit as though it had been
-            # measured. Absent means absent: the key is omitted and the fitter
-            # excludes the dataset from the wavelength response rather than
-            # fitting a fabricated point.
-            pot_params = {
-                'stimulus_type': 'light',
-                'intensity': stimulus_params.get('intensity_pot', 20),
-                'pulse_width_ms': stimulus_params.get('pulse_width_ms', 100),
-                'n_pulses': len(pot_data.get('conductance_S', [])),
-                'notes': f'Potentiation cycle {cycle_idx + 1}'
-            }
-            if stimulus_params.get('wavelength_pot') is not None:
-                pot_params['wavelength_nm'] = stimulus_params['wavelength_pot']
-
-
+        for phase, short in (('potentiation', 'pot'), ('depression', 'dep')):
+            phase_data = cycle.get(phase)
+            if phase_data is None:
+                continue
+            # No wavelength or intensity fallback of any kind. An unrecorded
+            # one is omitted, and the depression run is never labelled with the
+            # potentiation band (the spectral fit cannot detect that).
+            cfg = cycle_results.get(f'{short}_params') or phase_data.get('params')
+            params = _cycle_phase_params(
+                shared, cfg, phase_data, short,
+                f'{phase.capitalize()} cycle {cycle_idx + 1}')
             dataset = convert_pulse_sequence_to_dataset(
-                pot_data,
-                'potentiation',
-                pot_params,
-                f"cycle{cycle_idx + 1}_potentiation"
-            )
+                phase_data, phase, params, f"cycle{cycle_idx + 1}_{phase}")
             dataset['metadata']['cycle_index'] = cycle_idx + 1
-            dataset['metadata']['cycle_phase'] = 'potentiation'
+            dataset['metadata']['cycle_phase'] = phase
             datasets.append(dataset)
-        
-        # Depression phase
-        if 'depression' in cycle and cycle['depression'] is not None:
-            dep_data = cycle['depression']
-            
-            # As above: no 365 nm fallback, and no falling back to the
-            # POTENTIATION wavelength when the depression one is absent — that
-            # substitution labelled a depression run with the potentiation
-            # band, which is exactly the kind of error the spectral fit cannot
-            # detect and cannot recover from.
-            dep_params = {
-                'stimulus_type': 'light',
-                'intensity': stimulus_params.get('intensity_dep', 20),
-                'pulse_width_ms': stimulus_params.get('pulse_width_ms', 100),
-                'n_pulses': len(dep_data.get('conductance_S', [])),
-                'notes': f'Depression cycle {cycle_idx + 1}'
-            }
-            if stimulus_params.get('wavelength_dep') is not None:
-                dep_params['wavelength_nm'] = stimulus_params['wavelength_dep']
 
-
-            dataset = convert_pulse_sequence_to_dataset(
-                dep_data,
-                'depression',
-                dep_params,
-                f"cycle{cycle_idx + 1}_depression"
-            )
-            dataset['metadata']['cycle_index'] = cycle_idx + 1
-            dataset['metadata']['cycle_phase'] = 'depression'
-            datasets.append(dataset)
-    
     # Add cycle-level metadata to all datasets.
     #
     # This loop used to overwrite every dataset's experiment_type with
@@ -438,10 +626,7 @@ def convert_stdp_to_dataset(stdp_result: Dict, stimulus_params: Dict,
         'stimulus_type': stimulus_params.get('stimulus_type', 'electrical'),
         'notes': stimulus_params.get('notes', 'STDP timing window'),
     }
-    for key in ('wavelength_nm', 'intensity', 'pulse_width_ms', 'n_pulses'):
-        if key in stimulus_params:
-            metadata['wavelength_pot' if key == 'wavelength_nm' else key] = \
-                stimulus_params[key]
+    _add_stimulus_metadata(metadata, stimulus_params, 'wavelength_pot')
 
     derived_metrics = compute_derived_metrics(
         np.array(x_data, dtype=float), np.array(y_data, dtype=float), metadata
@@ -498,10 +683,7 @@ def convert_srdp_to_dataset(srdp_result: Dict, stimulus_params: Dict,
         'stimulus_type': stimulus_params.get('stimulus_type', 'electrical'),
         'notes': stimulus_params.get('notes', 'SRDP frequency response'),
     }
-    for key in ('wavelength_nm', 'intensity', 'pulse_width_ms', 'n_pulses'):
-        if key in stimulus_params:
-            metadata['wavelength_pot' if key == 'wavelength_nm' else key] = \
-                stimulus_params[key]
+    _add_stimulus_metadata(metadata, stimulus_params, 'wavelength_pot')
 
     derived_metrics = compute_derived_metrics(
         np.array(x_data, dtype=float), np.array(y_data, dtype=float), metadata
@@ -521,35 +703,31 @@ def convert_retention_to_dataset(retention_result: Dict,
                                 stimulus_params: Dict) -> Dict:
     """
     Convert retention measurement to dataset format.
-    
+
     Args:
-        retention_result: Output from measure_retention() function
+        retention_result: Output from measure_retention(): needs 'time_s' and
+            'conductance_S'.
         stimulus_params: Dict with measurement details
-    
+
     Returns:
         dict: Dataset in data_converter.py format
     """
     params = stimulus_params.copy()
     params['notes'] = params.get('notes', 'Retention/decay measurement')
-    
-    # Build result dict if not already in right format
-    if 'time_s' not in retention_result:
-        # Assume it's already in the right format
-        result = retention_result
-    else:
-        result = {
-            'time_s': retention_result['time_s'],
-            'conductance_S': retention_result['conductance_S']
-        }
-    
-    dataset = convert_pulse_sequence_to_dataset(
-        result,
-        'retention',
-        params,
-        'retention_measurement'
-    )
-    
-    return dataset
+
+    # An explicit check, not a pass-through: a result without these arrays used
+    # to be handed on to the pulse converter, which then guessed an x-axis.
+    for key in ('time_s', 'conductance_S'):
+        if key not in retention_result:
+            raise ValueError(
+                f"Retention measurement has no '{key}' array. "
+                f"Keys present: {', '.join(sorted(retention_result))}"
+            )
+    result = {'time_s': retention_result['time_s'],
+              'conductance_S': retention_result['conductance_S']}
+
+    return convert_pulse_sequence_to_dataset(
+        result, 'retention', params, 'retention_measurement')
 
 
 # =============================================================================
@@ -566,82 +744,93 @@ def build_characterization_suite(
     stdp_result: Optional[Dict] = None,
     srdp_result: Optional[Dict] = None,
     stimulus_params: Optional[Dict] = None,
-    metadata: Optional[Dict] = None
+    metadata: Optional[Dict] = None,
+    result_params: Optional[Dict] = None
 ) -> Dict:
     """
     Build complete characterization suite from raw Keithley measurement results.
     Now generates JSON format compatible with data_converter.py output.
-    
+
+    Each dataset carries the metadata of the run it came from (stimulus type,
+    wavelength, intensity, pulse width, period, n_pulses), read from that run's
+    own recorded parameters. `stimulus_params` is only a shared base for keys a
+    run does not carry; nothing is defaulted when it is None.
+
     Args:
         wavelength_results: List of results at different wavelengths
-        wavelengths: Corresponding wavelength values (nm)
+        wavelengths: Corresponding wavelength values (nm); when omitted, taken
+            from each result's own recorded wavelength (an error if absent)
         ltp_result: Single LTP measurement for nonlinearity
         ltd_result: Single LTD measurement (optional)
         cycle_results: Potentiation-depression cycling data
         retention_result: Decay measurement
         stdp_result: STDP timing-window sweep (for the STDP window fit)
         srdp_result: SRDP frequency sweep (for the SRDP sigmoid fit)
-        stimulus_params: Dict with measurement conditions (intensity, pulse_width, etc.)
+        stimulus_params: Shared base conditions (lowest precedence)
         metadata: Additional information (sample_id, date, operator, etc.)
-    
+        result_params: Explicit per-result overrides (highest precedence), for
+            results that carry no parameters of their own. Keys 'ltp', 'ltd',
+            'retention', 'stdp', 'srdp' map to a dict; 'wavelength' maps to a
+            list of dicts, one per wavelength result.
+
     Returns:
         dict: Complete characterization_suite in data_converter.py format
     """
     datasets = []
-    
-    if stimulus_params is None:
-        stimulus_params = {
-            'stimulus_type': 'light',
-            'intensity': 20,
-            'pulse_width_ms': 100,
-            'frequency_Hz': 10
-        }
-    
+    shared = dict(stimulus_params or {})
+    explicit = result_params or {}
+
     # Convert wavelength sweep
-    if wavelength_results is not None and wavelengths is not None:
-        wl_datasets = convert_wavelength_sweep(wavelength_results, wavelengths, stimulus_params)
-        datasets.extend(wl_datasets)
-    
+    if wavelength_results is not None:
+        if wavelengths is None:
+            wavelengths = []
+            for i, r in enumerate(wavelength_results):
+                wl = _resolve_params(None, r, (explicit.get('wavelength') or [None] * (i + 1))[i]
+                                     ).get('wavelength_nm')
+                if wl is None:
+                    raise ValueError(
+                        f"Wavelength result {i} records no wavelength_nm and no "
+                        "`wavelengths` list was given.")
+                wavelengths.append(wl)
+        datasets.extend(convert_wavelength_sweep(
+            wavelength_results, wavelengths, shared, explicit.get('wavelength')))
+
     # Convert LTP (nonlinearity)
     if ltp_result is not None:
-        params = stimulus_params.copy()
+        params = _resolve_params(shared, ltp_result, explicit.get('ltp'))
         params['notes'] = 'Long-term potentiation for nonlinearity extraction'
-        ltp_dataset = convert_pulse_sequence_to_dataset(
-            ltp_result, 'potentiation', params, 'ltp_nonlinearity'
-        )
-        datasets.append(ltp_dataset)
-    
+        datasets.append(convert_pulse_sequence_to_dataset(
+            ltp_result, 'potentiation', params, 'ltp_nonlinearity'))
+
     # Convert LTD
     if ltd_result is not None:
-        params = stimulus_params.copy()
+        params = _resolve_params(shared, ltd_result, explicit.get('ltd'))
         params['notes'] = 'Long-term depression'
-        ltd_dataset = convert_pulse_sequence_to_dataset(
-            ltd_result, 'depression', params, 'ltd_measurement'
-        )
-        datasets.append(ltd_dataset)
-    
+        datasets.append(convert_pulse_sequence_to_dataset(
+            ltd_result, 'depression', params, 'ltd_measurement'))
+
     # Convert cycling data
     if cycle_results is not None:
-        cycle_datasets = convert_cycle_to_datasets(cycle_results, stimulus_params)
-        datasets.extend(cycle_datasets)
-    
+        datasets.extend(convert_cycle_to_datasets(cycle_results, shared))
+
     # Convert retention
     if retention_result is not None:
-        retention_dataset = convert_retention_to_dataset(retention_result, stimulus_params)
-        datasets.append(retention_dataset)
+        datasets.append(convert_retention_to_dataset(
+            retention_result,
+            _resolve_params(shared, retention_result, explicit.get('retention'))))
 
     # Convert STDP timing window
     if stdp_result is not None:
-        params = stimulus_params.copy()
+        params = _resolve_params(shared, stdp_result, explicit.get('stdp'))
         params['notes'] = 'STDP timing window'
         datasets.append(convert_stdp_to_dataset(stdp_result, params))
 
     # Convert SRDP frequency response
     if srdp_result is not None:
-        params = stimulus_params.copy()
+        params = _resolve_params(shared, srdp_result, explicit.get('srdp'))
         params['notes'] = 'SRDP frequency response'
         datasets.append(convert_srdp_to_dataset(srdp_result, params))
-    
+
     # Build final suite in data_converter.py format
     suite = {
         'datasets': datasets,
@@ -658,6 +847,121 @@ def build_characterization_suite(
         suite['user_metadata'] = {'note': 'No metadata provided'}
     
     return suite
+
+
+# =============================================================================
+# PURE PARAMETER VALIDATION (GUI-free, so it can be tested without Tk)
+# =============================================================================
+#
+# Each raises ValueError with a message the GUI shows verbatim, and each runs
+# before any instrument is opened.
+
+def require_count(value: float, label: str, minimum: int = 1,
+                  maximum: Optional[int] = None, limit_name: str = "") -> int:
+    """A whole-number count within [minimum, maximum].
+
+    `int(3.7)` silently truncated a typed 3.7 to 3 pulses, and a count of 0 or
+    below "completed" with empty arrays (SRDP) or raised a bare IndexError.
+    """
+    if not float(value).is_integer():
+        raise ValueError(
+            f"{label}: {value:g} is not a whole number. Enter an integer "
+            f"(the value would otherwise be silently truncated to {int(value)}).")
+    n = int(value)
+    if n < minimum:
+        raise ValueError(f"{label}: {n} is below the minimum of {minimum}.")
+    if maximum is not None and n > maximum:
+        raise ValueError(
+            f"{label}: {n} exceeds the maximum of {maximum}"
+            + (f" ({limit_name})." if limit_name else "."))
+    return n
+
+
+def check_stdp_plan(delta_t_ms, pulse_width_ms: float, pair_period_ms: float) -> None:
+    """Validate a whole STDP sweep before any hardware activity.
+
+    Delta_t is onset-to-onset, so every |Delta_t| must be at least one pulse
+    width (otherwise the spikes would overlap, which the sequential generator
+    cannot produce and which used to fail mid-sweep after hardware activity);
+    Delta_t = 0 has no pre/post order; duplicate points add no information; and
+    the pair period (an absolute period on the on-instrument path) must contain
+    the longest pair, |Delta_t|max + one pulse width.
+    """
+    dt = np.asarray(delta_t_ms, dtype=float)
+    if dt.size < 1 or not np.all(np.isfinite(dt)):
+        raise ValueError("STDP: the delta-t list is empty or contains non-finite values.")
+    problems = []
+    if np.any(dt == 0):
+        problems.append(
+            "delta-t = 0 ms has no pre/post order; choose a point count that "
+            "does not place a point at 0 (e.g. an even count for a symmetric range).")
+    if np.unique(dt).size != dt.size:
+        problems.append(
+            "the delta-t list contains duplicate points (start equals end, or "
+            "repeated values); each timing must be measured once.")
+    too_short = sorted({float(round(abs(x), 4)) for x in dt if 0 < abs(x) < pulse_width_ms})
+    if too_short:
+        problems.append(
+            f"|delta-t| = {', '.join(f'{x:g}' for x in too_short[:4])} ms is shorter than "
+            f"the pulse width ({pulse_width_ms:g} ms). Delta-t is onset-to-onset, so the "
+            f"spikes would overlap. Use |delta-t| >= {pulse_width_ms:g} ms, or a shorter pulse.")
+    if pair_period_ms < pulse_width_ms:
+        problems.append(
+            f"the pair period ({pair_period_ms:g} ms) is shorter than the pulse width "
+            f"({pulse_width_ms:g} ms).")
+    longest = float(np.max(np.abs(dt))) + pulse_width_ms
+    if pair_period_ms < longest:
+        problems.append(
+            f"the pair period ({pair_period_ms:g} ms) cannot contain the longest pair "
+            f"({longest:g} ms = max |delta-t| + one pulse width).")
+    if problems:
+        raise ValueError("STDP sweep is not runnable:\n- " + "\n- ".join(problems)
+                         + "\nNothing was measured.")
+
+
+def check_srdp_range(freq_start_hz: float, freq_end_hz: float, n_points: int) -> None:
+    """The sweep must rise: end below start was accepted and ran backwards."""
+    if freq_end_hz < freq_start_hz:
+        raise ValueError(
+            f"SRDP: end frequency ({freq_end_hz:g} Hz) is below the start frequency "
+            f"({freq_start_hz:g} Hz). Enter the lower frequency first.")
+    if freq_end_hz == freq_start_hz and n_points > 1:
+        raise ValueError(
+            f"SRDP: start and end are both {freq_start_hz:g} Hz, so all {n_points} "
+            "points would be the same frequency.")
+
+
+def check_visual_window(pulse_width_ms: float, start_delay_ms: float,
+                        end_margin_ms: float, nplc: float, line_freq_hz: float) -> None:
+    """The ADC integration must complete inside the light pulse.
+
+    Optical dose is intensity x pulse width only if the whole integration
+    (nplc / line frequency) happens while the LED is on, so a window shorter
+    than one integration is a configuration error, not something to run.
+    """
+    window = pulse_width_ms - start_delay_ms - end_margin_ms
+    if window <= 0:
+        raise ValueError(
+            f"Invalid measurement window: pulse width ({pulse_width_ms:g} ms) must "
+            f"exceed start delay ({start_delay_ms:g} ms) + end margin ({end_margin_ms:g} ms).")
+    integration = nplc * 1000.0 / line_freq_hz
+    if integration > window:
+        raise ValueError(
+            f"One ADC integration ({integration:.2f} ms at NPLC={nplc:g}, "
+            f"{line_freq_hz:g} Hz) does not fit the measurement window "
+            f"({window:.2f} ms = pulse width {pulse_width_ms:g} - start delay "
+            f"{start_delay_ms:g} - end margin {end_margin_ms:g}).\n"
+            "Increase the pulse width, lower NPLC, or shorten the start delay / end margin.")
+
+
+def retention_waits_from_times(times_s) -> List[float]:
+    """Waits before each reading from absolute sample times (s since start)."""
+    t = [float(x) for x in times_s]
+    if not t or t[0] <= 0 or any(b <= a for a, b in zip(t, t[1:])):
+        raise ValueError(
+            "Retention sample times must be positive and strictly increasing "
+            f"(got {t}).")
+    return [t[0]] + [b - a for a, b in zip(t, t[1:])]
 
 
 # =============================================================================
@@ -800,7 +1104,14 @@ def validate_suite(suite: Dict) -> Dict:
         if 'retention' not in exp_types:
             report['recommendations'].append("Add retention measurement for decay time constant (tau)")
         
-        if len([ds for ds in datasets if 'wavelength' in ds['metadata'].get('notes', '').lower()]) < 3:
+        # Judged from the wavelengths the datasets actually carry, not from a
+        # free-text "notes" field that nothing guarantees mentions one.
+        distinct_wl = {
+            ds['metadata'].get('wavelength_pot', ds['metadata'].get('wavelength_dep'))
+            for ds in datasets
+            if ds['metadata'].get('experiment_type') in ('potentiation', 'depression')
+        } - {None}
+        if len(distinct_wl) < 3:
             report['recommendations'].append("Add wavelength sweep (3+ wavelengths) for spectral sensitivity")
         
         # Counts DATASETS, not data points. The old wording ("current: N,

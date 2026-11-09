@@ -11,7 +11,7 @@ prove a fix worked, and several of the fixes — the STDP normalisation above al
 python -m pytest verification/ -q
 ```
 
-**270 tests, about 15 seconds.** No hardware, no GUI, no `PYTHONIOENCODING` (that
+**383 tests, about 15 seconds.** No hardware, no GUI, no `PYTHONIOENCODING` (that
 was a workaround for C5/H22, both now fixed at source).
 
 This is the authority on what the suite currently does. `AUDIT_2026-07-31.md`

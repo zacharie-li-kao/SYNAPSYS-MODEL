@@ -120,11 +120,11 @@ def cycle_sequence(instrument, train_a_config, train_b_config, n_cycles,
 
     print(f"Executing cycle sequence via LUA...")
     print(f"  Cycles: {n_cycles}")
-    print(f"  Train A: {train_a_config['topology']}, {train_a_config['n_pulses']} pulses, "
-          f"write={train_a_config['stim_level']}V on {train_a_config['write_ch']}")
-    if train_b_config:
-        print(f"  Train B: {train_b_config['topology']}, {train_b_config['n_pulses']} pulses, "
-              f"write={train_b_config['stim_level']}V on {train_b_config['write_ch']}")
+    for label, cfg in (("Train A", train_a_config), ("Train B", train_b_config)):
+        if cfg:
+            unit = 'A' if cfg.get('stim_drive_type', 'V') == 'I' else 'V'
+            print(f"  {label}: {cfg['topology']}, {cfg['n_pulses']} pulses, "
+                  f"write={cfg['stim_level']}{unit} on {cfg['write_ch']}")
     print(f"  Expected time: {expected_time_s:.1f}s")
 
     # --- Execute ---
@@ -137,6 +137,18 @@ def cycle_sequence(instrument, train_a_config, train_b_config, n_cycles,
         raw_data, buffer_map, train_a_config, train_b_config, n_cycles,
         inter_train_delay_ms, inter_cycle_delay_ms
     )
+
+    # Provenance, as pulse-read carries it: the only execution path here is the
+    # on-instrument script, and what it actually delivered travels with the data.
+    results["execution_path"] = 'lua'
+    results["timing"] = raw_data["timing"]
+
+    # Nothing parsed is a failed run, whatever the instrument said: reporting it
+    # complete is how an aborted script once ended in "[OK]" with no data.
+    if results["n_cycles_parsed"] == 0:
+        raise RuntimeError(
+            f"Cycle sequence returned no complete cycle (0 of {n_cycles} parsed); "
+            "the buffer held fewer points than one cycle needs.")
 
     # --- Summary metrics ---
     results["summary_metrics"] = calculate_cycle_summary_metrics(results)
@@ -159,7 +171,11 @@ def cycle_sequence(instrument, train_a_config, train_b_config, n_cycles,
                 dg = (g_valid[-1] - g_valid[0]) / g_valid[0] * 100
                 print(f"  Cycle {cn} Train B: ΔG = {dg:.1f}%")
 
-    print(f"[OK] Cycle sequence complete")
+    if results["truncated"]:
+        print(f"[INCOMPLETE] Cycle sequence: only {results['n_cycles_parsed']} of "
+              f"{n_cycles} cycles were recovered (results['truncated'] is True)")
+    else:
+        print(f"[OK] Cycle sequence complete")
     return results
 
 
@@ -627,6 +643,18 @@ def save_cycle_data(cycle_results, filename):
     csv_content.append("# Potentiation-Depression Cycle Characterization")
     csv_content.append(f"# n_cycles={cycle_results['n_cycles']}")
     csv_content.append(f"# inter_cycle_delay_ms={cycle_results.get('inter_cycle_delay_ms', 0)}")
+    # Acquisition provenance and delivered timing, as the pulse-read export
+    # carries them; "not_recorded" rather than silence when absent.
+    csv_content.append(f"# execution_path={cycle_results.get('execution_path', 'unknown')}"
+                       " # pulse_index_0=pre_stimulus_baseline")
+    _timing = cycle_results.get('timing')
+    if _timing:
+        for _key, _val in _timing.items():
+            if isinstance(_val, dict):
+                csv_content.append("# timing_" + _key + ": "
+                                   + " # ".join(f"{k}={v}" for k, v in _val.items()))
+    else:
+        csv_content.append("# timing_status=not_recorded")
     
     # Potentiation parameters
     pot_params = cycle_results["pot_params"]

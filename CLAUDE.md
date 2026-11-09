@@ -200,13 +200,16 @@ deliberate design, not decoration — do not "simplify" them away.
   documented defaults with the reason stated. Both the SNN tab and the Network tab's spiking
   mode use it. Plots draw the fitted models through the same functions the fits use
   (`stdp_window_percent`, `srdp_sigmoid_percent`) — never a re-typed formula or scale factor.
+- **Suite export metadata is per run.** Each dataset in an exported characterisation suite carries the stimulus of the run it came from (`assembly_helpers.stimulus_params_from_run`): type, wavelength, intensity, width, period, count. One run's settings were once stamped on every dataset, so a sweep at 10/20/30 mW/cm² was exported at 30 and responsivity came out 3x wrong. Converters invent nothing: an unmeasured value is omitted, for the fitter to flag.
 - **Both network classes share the spatial interface** (`network.SpatialArrayMixin`:
   `history`, `current_time` in seconds, `apply_spatial_pattern`), so the Network tab works the
   same in rate and spiking mode.
 
 ## Verification
 
-`python -m pytest verification/ -q` — ~5 s, no hardware, no GUI. Proves the
+`verification/tsp_sim.py` is a simulated 2600 that **executes** every TSP command and script in a real Lua runtime (needs `pip install lupa`), with a virtual clock and a DUT whose conductance integrates the applied stimulus, modelling the manual's defaults (DELAY_AUTO per range, `delay(0)` rejected, ASCII precision 6). The `test_lua_execution_*` files run the real generated scripts on it; a change to a generator must keep them green.
+
+`python -m pytest verification/ -q` — ~15 s, no hardware, no GUI. Proves the
 invariants above have not regressed and pins every fitted parameter of the synthetic
 pipeline. See `verification/README.md`. Run it before and after any change to
 `synapse_engine.py`, `fitting.py`, `generate_test_data.py` or `data_converter.py`.
@@ -227,7 +230,12 @@ Hardware measurement + simulation engine. Generates LUA scripts for pulse-read, 
 - The cycle LUA script uses a **single monotonic `t_abs` accumulator** across all trains and cycles with one `timer.reset()` at script start. No timer reset between trains or cycles — prevents boundary drift.
 - Script upload uses **concatenated chunks** (~512 bytes) to minimize VISA write count — never line-by-line.
 - `execute_lua_script_fast` and `execute_cycle_lua` wait for completion via a **TSP `print(LUA_DONE_TOKEN)` sentinel** emitted as the script's last statement, read with an extended timeout. Do **not** use `*OPC?` here — it latches on anonymous `loadandrunscript` and stalls 60–120 s (rationale documented at `synapse_engine.py:17-22`). Fallback is sleep-based (never poll `nvbuffer1.n` during execution — that causes TSP context switches and timing jitter; the `.n` poll happens only after the fallback wait).
-- STDP spikes and single-channel cycle write+read use **level changes** (`source.levelv`), not `OUTPUT_ON`/`OUTPUT_OFF` relay toggling.
+- **Every** generator (pulse-read, visual, continuous visual, cycle, STDP) pulses with **level changes** (`source.levelv`/`leveli`): the stim output is turned ON once at level 0 and OFF only at cleanup. With the default `offmode` NORMAL, `OUTPUT_OFF` never opened the relay (it holds 0 V at a 1 mA off-limit, RM 2-77), so per-pulse toggling bought nothing but command latency. Single-channel cycling returns the line to 0 V between reads, like pulse-read (read disturb); dual-channel holds read bias by design.
+- **Read-channel ADC state is fully explicit** via `_emit_read_adc_setup`: `measure.delay = 0`, nplc, count/filter, then `AUTOZERO_ONCE` (after nplc — the zero cache is per aperture). The 263x default `DELAY_AUTO` silently added the range settling time to every read (2.5 ms at 1 µA, 15 ms at 100 nA, 90 ms at 10 nA), shifting reads after the pulse and halving the rate on low ranges; settling is now the script's own `read_settle`, checked by `check_read_settle` against `CURRENT_RANGE_SETTLING_S` (RM 2600A Table 4-4), warned and recorded — never refused. AUTOZERO OFF alone reused a stale zero "regardless of age". The channel's original `measure.delay`/`autozero` are saved and put back by `_emit_restore_adc`, so nothing outlives the run. Retention (autorange, seconds apart) keeps `DELAY_AUTO` deliberately.
+- **No `delay(0)`**: the 2600 rejects it (RM 7-47) and the whole script aborted. Static delays go through `lua_delay`, dynamic ones keep their `> 0` guards.
+- **Before upload, `_drain_output`** discards stale tokens; **before `printbuffer`, `format.asciiprecision = 15`** (the default 6 quantised timestamps to 1 ms beyond 100 s and raised false drift alarms). Timeouts use the *feasible* duration, not the nominal one.
+- **No silent re-run on a stimulated device.** Once `endscript` has been sent, a LUA failure raises (with the buffer count and the error queue) — falling back to the standard path is allowed only before the script ran. Cycle and STDP faults switch the outputs off and raise; nothing reports OK on a partial run, and STDP can never reuse a previous point's globals.
+- **Every timing record carries `period_delivered`** (True / False / None = unverified) and `settle_warning`; pulse-read, visual, cycle (per train, with `SYN_TIMING`), STDP and SRDP. The GUI reports the execution path and warns on anything but a verified delivery.
 - All LUA scripts use **anonymous `loadandrunscript`/`endscript`** — `endscript` triggers immediate execution. No named scripts, no `script.delete`, no error -292 on front panel. Never use `loadscript <name>` (named scripts require deletion, and all deletion patterns — `if script.user.scripts.X`, `pcall(script.delete, 'X')` — generate error -292 on the 2636A front panel despite Lua-level error suppression).
 - Buffer retrieval uses **chunked `printbuffer`** (500 points/read) to avoid VISA output buffer overflow.
 - Post-execution **timing drift analysis** from buffer timestamps is reported in the console for all modes (pulse-read and cycle).
